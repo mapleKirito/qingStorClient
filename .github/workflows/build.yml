@@ -19,7 +19,7 @@ jobs:
         include:
           - os: windows-latest
             artifact: qingstor-client-windows
-          - os: macos-latest
+          - os: macos-14
             artifact: qingstor-client-macos
           - os: ubuntu-latest
             artifact: qingstor-client-linux
@@ -49,9 +49,11 @@ jobs:
         if: matrix.os == 'windows-latest'
         run: pyinstaller --noconfirm --clean --windowed --onefile --name qingstor-client main.py
 
-      - name: 构建（macOS .app）
-        if: matrix.os == 'macos-latest'
-        run: pyinstaller --noconfirm --clean --windowed --name qingstor-client main.py
+      - name: 构建（macOS .app，universal2 兼容 Intel/Apple Silicon）
+        if: matrix.os == 'macos-14'
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
+        run: pyinstaller --noconfirm --clean --windowed --target-architecture universal2 --name qingstor-client main.py
 
       - name: 构建（Linux 单文件）
         if: matrix.os == 'ubuntu-latest'
