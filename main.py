@@ -7,16 +7,18 @@ from __future__ import annotations
 
 import sys
 
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QDialog
 
 from app.config import ConfigManager
 from app.ui.config_dialog import ConfigDialog
 from app.ui.main_window import MainWindow
+from app.version import __version__ as VERSION
 
 
 def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("QingStor Client")
+    print(f"青云对象存储客户端 v{VERSION}")
 
     cfg = ConfigManager.load()
     first_run = cfg is None or not cfg.is_complete()
@@ -24,7 +26,7 @@ def main() -> int:
     if first_run:
         dlg = ConfigDialog(cfg, first_run=True)
         # 取消则退出
-        if dlg.exec() != dlg.Accepted:
+        if dlg.exec() != QDialog.Accepted:
             return 0
         cfg = dlg.cfg
 
