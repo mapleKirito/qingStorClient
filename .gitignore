@@ -11,6 +11,9 @@ build/
 dist/
 *.spec
 
+# 线下分发压缩包（不入库）
+*.zip
+
 # 系统
 .DS_Store
 Thumbs.db
