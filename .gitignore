@@ -1,18 +1,29 @@
-# Python
-__pycache__/
-*.py[cod]
-*.egg-info/
-.venv/
-venv/
-env/
-
-# PyInstaller 构建产物
-build/
+# Node / Electron
+node_modules/
 dist/
+out/
 *.spec
+
+# 构建缓存
+.electron-builder/
+npm-debug.log*
 
 # 线下分发压缩包（不入库）
 *.zip
+*.tar.gz
+
+# 旧版 Python 实现遗留（已迁移到 Electron）
+__pycache__/
+*.pyc
+*.pyo
+
+# 编辑器 / 工具产物
+.screenshots/
+.trae-html-share-packages/
+
+# AI 协作记录（仅本地，不入库）
+.workbuddy/
+.claude/
 
 # 系统
 .DS_Store

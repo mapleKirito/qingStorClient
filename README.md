@@ -1,0 +1,164 @@
+# QingStorClient
+
+青云对象存储（QingStor / S3 兼容）桌面客户端。网盘式浏览桶内文件与目录，支持多选、文件夹上传/下载、拖拽上传、传输队列与断点取消。
+
+> 当前版本 **2.0.0**：已从 Python + PyQt 实现整体迁移到 Electron，架构与打包方式对齐 `myApiTools`。
+
+## 功能特性
+
+- 目录浏览：面包屑导航、`.` / `..` 占位行、多选（单击 / Ctrl / Shift / 全选）、右键菜单
+- 上传：多选文件、整个文件夹（保留层级）、拖拽文件与文件夹（取真实本地路径）
+- 下载：多文件 / 整个目录递归下载，落盘时按平台规则安全转义非法字符
+- 传输队列：最多并发 2 个任务，实时进度、逐文件进度、可取消、可清理已完成
+- 连接配置：Endpoint / Region / AccessKey / SecretKey / Bucket / 前缀 / 是否校验 SSL，落盘到 `userData/config.json`（密钥 base64 轻混淆，不随仓库分发）
+
+## 技术架构
+
+| 层 | 说明 |
+| --- | --- |
+| 主进程 `electron/` | CommonJS，负责 S3 访问、配置持久化、传输调度、原生菜单与对话框 |
+| 渲染进程 `renderer/` | 原生 ES Module + 原生 CSS，零构建步骤（无 webpack/vite） |
+| 进程通信 | `preload.js` 通过 `contextBridge` 暴露最小化 `bridge` API，`contextIsolation: true` / `nodeIntegration: false` |
+| 页面加载 | 自定义 `app://bundle` 特权协议，让渲染进程能用原生 ESM（`file://` 下不行） |
+| S3 SDK | `@aws-sdk/client-s3` + `@aws-sdk/lib-storage`（分片上传、进度、AbortController 取消） |
+
+```
+electron/
+  main.js        应用生命周期、窗口、菜单、IPC、app:// 协议
+  preload.js     contextBridge 白名单 API
+  config.js      配置读写（userData/config.json）
+  s3.js          S3 封装：列举/新建/删除/上传/下载/连接测试
+  transfers.js   传输队列（并发 2、进度节流推送、取消）
+  names.js       key ↔ 本地路径的可逆转义（Windows 严格 / POSIX 宽松）
+renderer/
+  index.html     单页外壳
+  css/app.css    深色主题
+  js/main.js     目录渲染、选择、拖拽、传输面板
+  js/util.js     格式化、toast、弹窗、右键菜单
+tools/
+  run-electron.js  启动器（剥离 ELECTRON_RUN_AS_NODE / NODE_OPTIONS）
+  dist-win.ps1     Windows 打包脚本（镜像 + 预解压 Electron + 临时输出目录）
+.github/workflows/build.yml  三平台构建与 Release
+```
+
+## 本地开发
+
+```bash
+npm install
+npm start          # 启动应用
+npm run smoke      # 冒烟测试：启动 → 加载界面 → 2.5s 后按有无渲染错误决定退出码
+```
+
+> 不要直接用 `electron .`。很多宿主环境（IDE 终端、CI、容器）会预设 `ELECTRON_RUN_AS_NODE=1`，这会让 `electron.exe` 退化成普通 Node 进程，报 `Cannot read properties of undefined (reading 'whenReady')`。`npm start` 已通过 `tools/run-electron.js` 剥掉该变量。
+
+## 本地打包（Windows）
+
+```bash
+npm run dist:win
+```
+
+产物在 `dist/`：
+
+- `QingStorClient-Setup-2.0.0-x64.exe` —— NSIS 安装版（可选安装目录、创建快捷方式）
+- `QingStorClient-2.0.0-x64.exe` —— 免安装便携版
+
+为什么不用 `npx electron-builder --win` 直接打：`tools/dist-win.ps1` 解决了两个本地必然会踩的坑。
+
+1. **EPERM: operation not permitted** —— electron-builder 先解压到 `win-unpacked.tmp` 再重命名，腾讯电脑管家一类的实时防护会短暂占用刚解压的 `.exe/.dll` 句柄导致重命名失败。脚本把已解压好的 Electron 通过 `--config.electronDist=` 注入，让它走 copyDir 分支（无 `.tmp`、无重命名），并且输出到 `%LOCALAPPDATA%\Temp\qingStorClient-dist`，成功后再回拷 `dist/`。
+2. **下载超时** —— 脚本内设置 `ELECTRON_MIRROR` / `ELECTRON_BUILDER_BINARIES_MIRROR` 走 npmmirror。
+
+> `electron-builder.yml` 里**故意不写** `electronDist`：它是全局配置，会同时作用于 mac/linux，而 `node_modules/electron/dist` 只有当前平台的运行时。硬编码会导致 mac 上打 x64 包却塞进 arm64 二进制、CI 三平台各自错乱。本地注入、CI 交给 electron-builder 按平台下载。
+
+mac / linux 打包需在对应系统上执行（`npm run dist:mac` / `dist:linux`），交叉编译不可靠。
+
+## 版本与发布
+
+版本号写在 `package.json` 的 `version`，Electron 侧通过 `app.getVersion()` 展示在状态栏。**所有触发方式都围绕这一个字段**，不要在别处再维护版本号。
+
+### 三档触发规则
+
+| 动作 | 产物性质 | 结果 |
+| --- | --- | --- |
+| 推 `v*` 标签（如 `v2.0.1`） | **正式包** | 三平台构建 → 自动创建 GitHub Release，安装包直接挂在页面上 |
+| 推 `ver/**` 分支（如 `ver/2.1`） | **开发包** | 三平台构建 → 只留在 Actions artifacts（保留 14 天），不发 Release |
+| 手动 Run workflow | **开发包** | 同上，适合验证任意提交而不污染版本历史 |
+
+开发包和正式包用的是同一份 `electron-builder.yml`、同一条构建命令，区别只在**有没有创建 Release**——判定条件就是 `release` job 的 `if: startsWith(github.ref, 'refs/tags/')`。所以开发包验证通过后再打标签，行为完全可预期。
+
+### 正式发版
+
+```bash
+# 1. 改 package.json 的 version（如 2.0.1）
+# 2. 提交
+git add -A && git commit -m "chore: release 2.0.1"
+git push
+# 3. 打标签并推送（标签必须和 version 一致，CI 会校验）
+git tag v2.0.1
+git push origin v2.0.1
+```
+
+- 标签名含 `-`（如 `v2.1.0-beta.1`）自动标记为 prerelease，不会顶掉 `latest`
+- CI 有版本守卫：标签名去掉 `v` 后必须严格等于 `package.json` 的 `version`，不一致直接失败（避免「v2.0.1 的 Release 里挂着 2.0.0 的包」）
+- `version` 里带 `-dev.N` / `-beta.N` 后缀时，产物文件名也会带上，方便区分开发版与正式版
+
+### 打开发包（不占版本号）
+
+```bash
+git checkout -b ver/2.1
+git push -u origin ver/2.1      # 触发构建，产物在 Actions 页面下载
+```
+
+验证没问题后合并回 `main`，再按上面的正式发版流程打标签。
+
+## 跨平台产物
+
+| 平台 | 产物 | 说明 |
+| --- | --- | --- |
+| Windows x64 | `.exe`（安装版 / 便携版） | 未签名，首次运行 SmartScreen 提示点「更多信息 → 仍要运行」 |
+| macOS x64 + arm64 | `.dmg` × 2 | 未签名未公证，首次打开被 Gatekeeper 拦截，见下方[对应章节](#macos-安装包首次打开被拦gatekeeper) |
+| Linux x64 | `.AppImage` / `.deb` | AppImage 需 `chmod +x`；deb 用 `sudo apt install ./xxx.deb` |
+
+## macOS 安装包首次打开被拦（Gatekeeper）
+
+**现象**：从浏览器下载 DMG，把 `.app` 拖进「应用程序」后双击，弹出「无法验证开发者」，只有「移到废纸篓」和「取消」两个按钮，**右键「打开」也绕不过**。
+
+**原因**：两件事叠加，缺一不可解。
+
+1. 打包侧没有任何 Apple 开发者证书 —— `build.yml` 里 `CSC_IDENTITY_AUTO_DISCOVERY: 'false'`、`electron-builder.yml` 里 `mac.identity: null`，所以 App 既没有 Developer ID 签名，也没有经过 Apple 公证（notarization）。
+2. 下载侧 —— 浏览器下载的文件带 `com.apple.quarantine` 隔离属性，macOS 对「已隔离 + 未签名/未公证」的应用直接拒绝启动。
+
+这是 Gatekeeper 的正常行为，不是安装包损坏。
+
+**放行（二选一，一次即可）**：
+
+```bash
+xattr -cr /Applications/QingStorClient.app
+```
+
+或：系统设置 → 隐私与安全性 → 底部点「仍要打开」。
+
+**Windows 对照**：Windows 侧是同一类限制的弱化版 —— 未签名触发 SmartScreen「Windows 已保护你的电脑」，点「更多信息 → 仍要运行」即可，不像 macOS 那样需要命令行。
+
+**彻底解决**（可选，需要付费 Apple Developer Program）：在 CI 里注入 `CSC_LINK` / `CSC_KEY_PASSWORD` 做 Developer ID 签名，再用 `APPLE_ID` / `APPLE_APP_SPECIFIC_PASSWORD` / `APPLE_TEAM_ID` 走 notarize，用户下载后即开即用。
+
+## 已知边界
+
+- **无代码签名**：mac 未公证、Windows 未签名，用户首次打开需手动放行，详见 [macOS 安装包首次打开被拦（Gatekeeper）](#macos-安装包首次打开被拦gatekeeper)
+- **无自定义应用图标**：沿用 Electron 默认图标。放置 `build/icon.ico`（Windows）、`build/icon.icns`（macOS）、`build/icon.png`（Linux，512×512 以上）后重新打包即自动生效，无需改配置
+- **不支持交叉编译**：mac / linux 包必须在对应系统或 GitHub Actions 上构建
+- **无自动更新**：未接入 `electron-updater`，升级需重新下载安装包
+
+
+## 数据存放位置
+
+配置保存在 Electron 的 `userData` 目录：
+
+- Windows：`%APPDATA%\qingstor-client\config.json`
+- macOS：`~/Library/Application Support/qingstor-client/config.json`
+- Linux：`~/.config/qingstor-client/config.json`
+
+删除该文件等同于「忘记所有连接配置」。
+
+## License
+
+MIT

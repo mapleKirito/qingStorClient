@@ -1,0 +1,68 @@
+# Electron 打包配置（qingstor-client）
+# 用法：npm run dist（当前平台全部 target） / npm run dist:win / dist:mac / dist:linux
+
+appId: com.qingstor.client
+productName: QingStorClient
+copyright: MIT Licensed
+
+directories:
+  output: dist
+  buildResources: build
+
+# 只打包运行必需的文件
+files:
+  - electron/**/*
+  - renderer/**/*
+  - package.json
+  - '!**/*.map'
+  - '!dist/**'
+  - '!docs/**'
+  - '!tools/**'
+
+asar: true
+
+# 注意：这里**不要**写 electronDist。
+# electronDist 是全局配置，会同时作用于 mac/linux；而 node_modules/electron/dist
+# 里只会有「当前机器平台+架构」的运行时。若在此硬编码，mac 上打 x64 的 dmg 会把
+# arm64 的 Electron 二进制塞进去，CI 三平台也会各自错乱。
+# 正确做法：本地 Windows 打包由 tools/dist-win.ps1 通过 --config.electronDist= 注入，
+# CI 与其它平台交给 electron-builder 自己按 平台/架构 下载对应运行时。
+
+win:
+  target:
+    - target: nsis
+      arch: [x64]
+    - target: portable
+      arch: [x64]
+  artifactName: ${productName}-${version}-${arch}.${ext}
+
+# nsis 与 portable 都产出 .exe，共用上面的 artifactName 会互相覆盖，
+# 所以安装器单独加 Setup 前缀。
+nsis:
+  artifactName: ${productName}-Setup-${version}-${arch}.${ext}
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: QingStorClient
+
+# x64 + arm64 双架构：Intel 与 Apple Silicon 都能用
+mac:
+  target:
+    - target: dmg
+      arch: [x64, arm64]
+  category: public.app-category.productivity
+  # 明确带上 ${arch}，x64 / arm64 两个 dmg 才不会互相覆盖
+  artifactName: ${productName}-${version}-${arch}.${ext}
+  # 无 Apple 开发者证书：显式声明不签名，避免 electron-builder 去自动探测身份
+  identity: null
+
+linux:
+  target:
+    - AppImage
+    - deb
+  category: Utility
+  # deb 打包强制要求 maintainer（含邮箱），这里显式给出，避免 author 为纯字符串时报错
+  maintainer: mapleKirito <mapleKirito@users.noreply.github.com>
+  artifactName: ${productName}-${version}-${arch}.${ext}

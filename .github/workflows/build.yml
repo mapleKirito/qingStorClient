@@ -1,68 +1,146 @@
-name: 跨平台构建
+name: Build Desktop App
 
-# 仅手动触发：推送后在 GitHub 仓库的 Actions 页面点 "Run workflow" 执行
+# 触发规则：
+#   push tag v*          -> 三平台构建 + 创建 GitHub Release（tag 即正式发布点）
+#   push branch ver/**   -> 仅构建、产出 Actions artifacts，不发 Release（快照分支验证用）
+#   workflow_dispatch    -> 手动触发，仅构建不发 Release（main / dev/** 等其余分支需要时手动点）
+# 注意：发 Release 只看 tag。分支推送和手动触发都只跑 build job，release job 会被 if 跳过。
 on:
+  push:
+    tags:
+      - 'v*'
+    branches:
+      - 'ver/**'
   workflow_dispatch:
-    inputs:
-      version:
-        description: "构建版本号（仅用于产物命名标识）"
-        required: false
-        default: "latest"
+
+# 创建 Release 需要对 contents 写权限
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
-    name: 构建 ${{ matrix.os }}
+    name: Build (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
+      # 某个平台失败不影响其它平台继续构建
       fail-fast: false
       matrix:
         include:
           - os: windows-latest
-            artifact: qingstor-client-windows
-          - os: macos-14
-            artifact: qingstor-client-macos
+            platform: win
+            artifacts: |
+              dist/*.exe
+          - os: macos-latest
+            platform: mac
+            artifacts: |
+              dist/*.dmg
           - os: ubuntu-latest
-            artifact: qingstor-client-linux
+            platform: linux
+            artifacts: |
+              dist/*.AppImage
+              dist/*.deb
 
     steps:
-      - name: 检出代码
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: 安装 Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: 安装依赖与 PyInstaller
+      # 版本规则守卫：打 v* 标签发布时，标签名必须与 package.json 的 version 一致。
+      # 否则产物文件名（取 version）与 Release 页标题（取 tag）会对不上，
+      # 出现「v2.0.1 的 Release 里挂着 2.0.0 的安装包」这种事故。
+      - name: Verify tag matches package.json version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pyinstaller
+          pkg_version="$(node -p "require('./package.json').version")"
+          tag_version="${GITHUB_REF_NAME#v}"
+          echo "tag=$GITHUB_REF_NAME  package.json=$pkg_version"
+          if [ "$tag_version" != "$pkg_version" ]; then
+            echo "::error::标签 $GITHUB_REF_NAME 与 package.json 版本 $pkg_version 不一致，请先改 package.json 再重新打标签"
+            exit 1
+          fi
 
-      - name: 安装 Linux 运行时依赖
-        if: matrix.os == 'ubuntu-latest'
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          # electron-builder 26 依赖 Node 22（ESM-only 依赖）
+          node-version: '22'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Linux packaging tools
+        if: matrix.platform == 'linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libxcb-cursor0 libxcb-xinerama0
+          sudo apt-get install --no-install-recommends -y libopenjp2-tools
 
-      - name: 构建（Windows 单文件）
-        if: matrix.os == 'windows-latest'
-        run: pyinstaller --noconfirm --clean --windowed --onefile --name qingstor-client main.py
-
-      - name: 构建（macOS .app，universal2 兼容 Intel/Apple Silicon）
-        if: matrix.os == 'macos-14'
+      - name: Build
         env:
-          MACOSX_DEPLOYMENT_TARGET: "11.0"
-        run: pyinstaller --noconfirm --clean --windowed --target-architecture universal2 --name qingstor-client main.py
+          # 没有签名证书，关掉 macOS 身份自动探测，避免签名步骤报错
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        # 每个 runner 只构建自己的平台；显式 --publish never，
+        # Release 由下面的 release job 统一创建，避免 electron-builder 隐式发布。
+        # 注意：CI 上不传 electronDist，让 electron-builder 按平台/架构下载正确的运行时。
+        run: npx electron-builder --${{ matrix.platform }} --publish never
 
-      - name: 构建（Linux 单文件）
-        if: matrix.os == 'ubuntu-latest'
-        run: pyinstaller --noconfirm --clean --windowed --onefile --name qingstor-client main.py
-
-      - name: 上传构建产物
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}-${{ github.event.inputs.version || 'latest' }}
-          path: |
-            dist/qingstor-client*
+          name: qingstor-client-${{ matrix.platform }}
+          path: ${{ matrix.artifacts }}
           if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    # 只有打标签才发 Release；手动触发/分支推送只构建
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          # 下载后按 artifact 名分目录：artifacts/qingstor-client-win/... 等
+          path: artifacts
+
+      - name: List downloaded files
+        run: find artifacts -type f
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          # artifacts/**/* 只包含三平台的安装包本体（exe / dmg / AppImage / deb），
+          # blockmap、latest*.yml、builder-debug.yml 已在上传阶段过滤掉
+          files: artifacts/**/*
+          body: |
+            ## macOS 用户请先看这里
+
+            本项目暂无 Apple 开发者证书，macOS 安装包**未做公证**，浏览器下载后首次打开会被拦截（提示「无法验证开发者」，只有「移到废纸篓」「取消」两个按钮），**右键「打开」也绕不过**。这是 Gatekeeper 在拦未隔离未公证的应用，不是包坏了。
+
+            把 DMG 里的 `.app` 拖进「应用程序」后，任选其一放行：
+
+            - 终端执行：`xattr -cr /Applications/QingStorClient.app`
+            - 或：系统设置 → 隐私与安全性 → 底部点「仍要打开」
+
+            放行一次即可，之后正常打开。Apple Silicon 选 `arm64`，Intel 或老旧系统选 `x64`。
+
+            ## Windows 用户
+
+            首次运行如遇 SmartScreen 提示，点「更多信息 → 仍要运行」即可。
+
+            ## Linux 用户
+
+            `AppImage` 下载后 `chmod +x` 直接运行；`deb` 用 `sudo apt install ./xxx.deb` 安装。
+          # 自动根据合并的 PR 和提交生成更新日志
+          generate_release_notes: true
+          # 版本号带 '-'（如 2.0.0-beta.1）时自动标记为预发布
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          fail_on_unmatched_files: true

@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:;" />
+  <title>QingStorClient</title>
+  <link rel="stylesheet" href="css/app.css" />
+</head>
+<body>
+  <!-- 顶栏 -->
+  <header id="topbar">
+    <div class="brand">
+      <div class="brand-logo">Q</div>
+      <div class="brand-text">
+        <div class="brand-name">QingStorClient</div>
+        <div class="brand-sub" id="brandBucket">未连接</div>
+      </div>
+    </div>
+    <nav id="breadcrumb" class="breadcrumb" aria-label="目录位置"></nav>
+    <div class="top-actions">
+      <button class="icon-btn" id="btnSettings" title="连接设置">⌁</button>
+    </div>
+  </header>
+
+  <!-- 工具栏 -->
+  <div id="toolbar">
+    <button class="tb-btn" id="btnUp" title="返回上一级 (Backspace)"><span class="ic">↑</span>上级</button>
+    <div class="tb-sep"></div>
+    <button class="tb-btn" id="btnUploadFiles" title="上传文件 (Ctrl+U)"><span class="ic">⤒</span>上传文件</button>
+    <button class="tb-btn" id="btnUploadFolder" title="上传文件夹 (Ctrl+Shift+U)"><span class="ic">⇪</span>上传文件夹</button>
+    <div class="tb-sep"></div>
+    <button class="tb-btn" id="btnDownload" title="下载选中项"><span class="ic">⤓</span>下载</button>
+    <button class="tb-btn" id="btnNewFolder" title="新建文件夹 (Ctrl+N)"><span class="ic">＋</span>新建文件夹</button>
+    <button class="tb-btn danger" id="btnDelete" title="删除选中项 (Delete)"><span class="ic">✕</span>删除</button>
+    <div class="tb-spacer"></div>
+    <button class="tb-btn" id="btnRefresh" title="刷新 (F5)"><span class="ic">↻</span>刷新</button>
+  </div>
+
+  <!-- 文件区 -->
+  <main id="fileArea">
+    <div class="table-head">
+      <label class="cell-check"><input type="checkbox" id="checkAll" /></label>
+      <div class="cell-name">名称</div>
+      <div class="cell-size">大小</div>
+      <div class="cell-time">修改时间</div>
+    </div>
+    <div id="tableBody" class="table-body" tabindex="0"></div>
+    <div id="loadingMask" class="loading-mask hidden">
+      <div class="spinner"></div>
+      <div>正在加载目录…</div>
+    </div>
+    <div id="dropOverlay" class="drop-overlay hidden">
+      <div class="drop-box">松开鼠标上传到当前目录</div>
+    </div>
+  </main>
+
+  <!-- 传输面板 -->
+  <section id="transferPanel" class="collapsed">
+    <div id="transferHeader" class="transfer-header">
+      <div class="th-left">
+        <span class="th-caret" id="transferCaret">▸</span>
+        <span>传输管理</span>
+        <span class="th-badge" id="transferBadge">0</span>
+      </div>
+      <button class="mini-btn" id="btnClearTransfers">清理已完成</button>
+    </div>
+    <div id="transferList" class="transfer-list"></div>
+  </section>
+
+  <!-- 状态栏 -->
+  <footer id="statusbar">
+    <span id="statLeft">就绪</span>
+    <span class="spacer"></span>
+    <span id="statVersion"></span>
+  </footer>
+
+  <!-- 弹窗根 -->
+  <div id="modalRoot"></div>
+  <!-- 右键菜单根 -->
+  <div id="ctxRoot"></div>
+  <!-- 轻提示根 -->
+  <div id="toastRoot"></div>
+
+  <script type="module" src="js/main.js"></script>
+</body>
+</html>
