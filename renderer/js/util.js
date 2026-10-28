@@ -236,9 +236,13 @@ export function showContextMenu(x, y, items) {
       menu.appendChild(sep);
     } else {
       const el = document.createElement('div');
-      el.className = 'ctx-item' + (it.danger ? ' danger' : '');
+      el.className = 'ctx-item' + (it.danger ? ' danger' : '') + (it.disabled ? ' disabled' : '');
       el.textContent = (it.icon ? it.icon + '  ' : '') + it.label;
-      el.addEventListener('click', () => { closeContextMenu(); it.click(); });
+      el.addEventListener('click', () => {
+        if (it.disabled) return;
+        closeContextMenu();
+        it.click();
+      });
       menu.appendChild(el);
     }
   }

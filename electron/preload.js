@@ -21,8 +21,14 @@ contextBridge.exposeInMainWorld('bridge', {
   s3: {
     test: (cfg) => ipcRenderer.invoke('s3:test', cfg),
     list: (dir) => ipcRenderer.invoke('s3:list', dir),
+    listDirs: (dir) => ipcRenderer.invoke('s3:listDirs', dir),
     mkdir: (dir) => ipcRenderer.invoke('s3:mkdir', dir),
     remove: (entries) => ipcRenderer.invoke('s3:delete', entries),
+  },
+
+  uiState: {
+    get: () => ipcRenderer.invoke('uiState:get'),
+    save: (partial) => ipcRenderer.invoke('uiState:save', partial),
   },
 
   dialog: {

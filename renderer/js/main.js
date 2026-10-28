@@ -2,8 +2,12 @@ import {
   fmtBytes, fmtTime, esc, toast, confirmDialog, promptDialog, configDialog, showContextMenu,
   updateAvailableDialog, updateProgressDialog,
 } from './util.js';
+import { createTree } from './tree.js';
 
 const $ = (id) => document.getElementById(id);
+
+/** 目录树实例，配置就绪后才创建（未连接时无事可列） */
+let tree = null;
 
 const state = {
   version: '',
@@ -41,6 +45,8 @@ async function loadDir(dir = state.currentDir, { silent = false } = {}) {
     state.entries = [...res.dirs, ...res.files];
     renderBreadcrumb();
     renderTable();
+    // 树只跟随高亮，不反向触发导航（避免 loadDir ⇄ 树选中 的循环）
+    if (tree) tree.setCurrent(dir);
   } catch (e) {
     if (seq === state.loadSeq) toast('加载目录失败：' + (e.message || e), 'err');
   } finally {
@@ -73,18 +79,8 @@ function bucketLabel() {
   return window.__brand || '未连接';
 }
 
-function visibleRows() {
-  // Linux 风格：顶部固定 . 与 ..
-  const rows = [];
-  rows.push({ special: '.', name: '.', isDir: true });
-  rows.push({ special: '..', name: '..', isDir: true });
-  for (const e of state.entries) rows.push(e);
-  return rows;
-}
-
 function renderTable() {
   const body = $('tableBody');
-  const rows = visibleRows();
   if (state.entries.length === 0) {
     body.innerHTML = `
       <div class="empty-state">
@@ -94,20 +90,7 @@ function renderTable() {
       </div>`;
   } else {
     let html = '';
-    rows.forEach((r, idx) => {
-      if (r.special) {
-        html += `
-          <div class="row special" data-idx="${idx}" data-special="${r.special}">
-            <label class="cell-check"></label>
-            <div class="cell-name">
-              <div class="file-ic dir">↩</div>
-              <span class="file-name" style="color:var(--dim)">${r.name}</span>
-            </div>
-            <div class="cell-size"></div>
-            <div class="cell-time"></div>
-          </div>`;
-        return;
-      }
+    state.entries.forEach((r, idx) => {
       const selected = state.selection.has(r.key);
       const size = r.isDir ? '—' : fmtBytes(r.size);
       const time = r.isDir ? '—' : fmtTime(r.mtime);
@@ -129,8 +112,7 @@ function renderTable() {
 }
 
 function rowEntry(idx) {
-  const rows = visibleRows();
-  return rows[idx] || null;
+  return state.entries[idx] || null;
 }
 
 function updateStatus() {
@@ -153,14 +135,14 @@ function updateCheckAll() {
 function selectOnly(idx) {
   state.selection.clear();
   const r = rowEntry(idx);
-  if (r && !r.special) state.selection.add(r.key);
+  if (r) state.selection.add(r.key);
   state.lastIndex = idx;
   renderTable();
 }
 
 function toggleSelect(idx) {
   const r = rowEntry(idx);
-  if (!r || r.special) return;
+  if (!r) return;
   if (state.selection.has(r.key)) state.selection.delete(r.key);
   else state.selection.add(r.key);
   state.lastIndex = idx;
@@ -173,7 +155,7 @@ function rangeSelect(idx) {
   state.selection.clear();
   for (let i = from; i <= to; i++) {
     const r = rowEntry(i);
-    if (r && !r.special) state.selection.add(r.key);
+    if (r) state.selection.add(r.key);
   }
   renderTable();
 }
@@ -183,9 +165,7 @@ function selectedEntries() {
 }
 
 function enterDir(entry) {
-  if (entry.special === '.') return loadDir(state.currentDir);
-  if (entry.special === '..') return goUp();
-  if (!entry.isDir) return;
+  if (!entry || !entry.isDir) return;
   loadDir(entry.key);
 }
 
@@ -236,6 +216,7 @@ async function deleteSelection(entries) {
     const r = await window.bridge.s3.remove(entries.map((e) => ({ key: e.key, isDir: !!e.isDir })));
     toast(`已删除 ${r.count} 个对象`, 'ok');
     loadDir(state.currentDir, { silent: true });
+    if (tree) tree.refresh(state.currentDir);
   } catch (e) {
     toast('删除失败：' + (e.message || e), 'err');
   }
@@ -254,6 +235,7 @@ async function newFolder() {
     await window.bridge.s3.mkdir(key);
     toast('文件夹已创建', 'ok');
     loadDir(state.currentDir, { silent: true });
+    if (tree) tree.refresh(state.currentDir);
   } catch (e) {
     toast('创建失败：' + (e.message || e), 'err');
   }
@@ -365,18 +347,15 @@ function togglePanel(force) {
 /* ================= 右键菜单 ================= */
 
 function rowContextMenu(e, entry) {
-  const target = entry.special ? [] : [entry];
-  if (!entry.special && !state.selection.has(entry.key)) selectOnly(parseInt(e.target.closest('.row').dataset.idx, 10));
-  const sel = entry.special ? [] : selectedEntries();
-  const items = [];
-  if (sel.length) {
-    items.push({ label: '下载…', icon: '⤓', click: () => downloadSelection(sel) });
-    items.push({ label: '删除', icon: '✕', danger: true, click: () => deleteSelection(sel) });
+  if (!entry) return;
+  if (!state.selection.has(entry.key)) selectOnly(parseInt(e.target.closest('.row').dataset.idx, 10));
+  const sel = selectedEntries();
+  const items = [
+    { label: '下载…', icon: '⤓', click: () => downloadSelection(sel) },
+    { label: '删除', icon: '✕', danger: true, click: () => deleteSelection(sel) },
+  ];
+  if (!entry.isDir) {
     items.push('-');
-  }
-  if (entry.special === '..') items.push({ label: '返回上一级', icon: '↩', click: goUp });
-  if (entry.special === '.') items.push({ label: '刷新', icon: '↻', click: () => loadDir(state.currentDir) });
-  if (!entry.special && !entry.isDir) {
     items.push({ label: '复制名称', icon: '⧉', click: () => { navigator.clipboard.writeText(entry.name); toast('已复制名称', 'ok'); } });
   }
   items.push('-');
@@ -386,6 +365,8 @@ function rowContextMenu(e, entry) {
 
 function emptyContextMenu(e) {
   showContextMenu(e.clientX, e.clientY, [
+    { label: '返回上一级', icon: '↩', disabled: !state.currentDir, click: goUp },
+    '-',
     { label: '刷新', icon: '↻', click: () => loadDir(state.currentDir) },
     '-',
     { label: '上传文件…', icon: '⤒', click: uploadFiles },
@@ -421,7 +402,7 @@ function bindEvents() {
     if (!row) return;
     const idx = parseInt(row.dataset.idx, 10);
     const entry = rowEntry(idx);
-    if (entry && entry.special) return;
+    if (!entry) return;
     if (e.target.tagName === 'INPUT') {
       toggleSelect(idx);
       return;
@@ -488,6 +469,7 @@ function bindEvents() {
     if (task.status === 'done' && task.type === 'upload') {
       // 上传完成后刷新当前目录（轻量、静默）
       loadDir(state.currentDir, { silent: true });
+      if (tree) tree.refresh(state.currentDir);
     }
   });
 
@@ -681,6 +663,8 @@ async function openSettings() {
   if (result && result.saved) {
     applyConfig(result.config);
     toast('配置已保存', 'ok');
+    // bucket / prefix 可能变了，树的缓存整体作废
+    if (tree) tree.refresh('');
     loadDir('');
   }
 }
@@ -689,6 +673,20 @@ function applyConfig(cfg) {
   state.configured = !!cfg;
   window.__brand = cfg ? `${cfg.bucket}${cfg.prefix ? ' / ' + cfg.prefix : ''}` : '未连接';
   $('brandBucket').textContent = window.__brand;
+}
+
+async function initTree() {
+  if (tree) return;
+  tree = createTree({
+    panel: $('treePanel'),
+    body: $('treeBody'),
+    splitter: $('treeSplitter'),
+    expandBtn: $('btnTreeExpand'),
+    collapseBtn: $('btnTreeCollapse'),
+    refreshBtn: $('btnTreeRefresh'),
+    onOpen: (key) => loadDir(key),
+  });
+  await tree.init();
 }
 
 async function boot() {
@@ -710,10 +708,13 @@ async function boot() {
     const r = await configDialog(null, { canCancel: false });
     if (r && r.saved) {
       applyConfig(r.config);
+      state.configured = true;
+      await initTree();
       loadDir('');
     }
   } else {
     state.configured = true;
+    await initTree();
     loadDir('');
   }
 }

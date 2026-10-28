@@ -16,43 +16,60 @@
         <div class="brand-sub" id="brandBucket">未连接</div>
       </div>
     </div>
-    <nav id="breadcrumb" class="breadcrumb" aria-label="目录位置"></nav>
     <div class="top-actions">
       <button class="icon-btn" id="btnSettings" title="连接设置">⌁</button>
     </div>
   </header>
 
-  <!-- 工具栏 -->
-  <div id="toolbar">
-    <button class="tb-btn" id="btnUp" title="返回上一级 (Backspace)"><span class="ic">↑</span>上级</button>
-    <div class="tb-sep"></div>
-    <button class="tb-btn" id="btnUploadFiles" title="上传文件 (Ctrl+U)"><span class="ic">⤒</span>上传文件</button>
-    <button class="tb-btn" id="btnUploadFolder" title="上传文件夹 (Ctrl+Shift+U)"><span class="ic">⇪</span>上传文件夹</button>
-    <div class="tb-sep"></div>
-    <button class="tb-btn" id="btnDownload" title="下载选中项"><span class="ic">⤓</span>下载</button>
-    <button class="tb-btn" id="btnNewFolder" title="新建文件夹 (Ctrl+N)"><span class="ic">＋</span>新建文件夹</button>
-    <button class="tb-btn danger" id="btnDelete" title="删除选中项 (Delete)"><span class="ic">✕</span>删除</button>
-    <div class="tb-spacer"></div>
-    <button class="tb-btn" id="btnRefresh" title="刷新 (F5)"><span class="ic">↻</span>刷新</button>
-  </div>
+  <!-- 主体：左目录树 + 右文件区 -->
+  <div id="mainRow">
+    <aside id="treePanel" aria-label="目录树">
+      <div class="tree-head">
+        <span class="tree-title">目录</span>
+        <button class="mini-btn" id="btnTreeRefresh" title="刷新目录树">↻</button>
+        <button class="mini-btn" id="btnTreeCollapse" title="收起目录树">«</button>
+      </div>
+      <div id="treeBody" class="tree-body"></div>
+    </aside>
 
-  <!-- 文件区 -->
-  <main id="fileArea">
-    <div class="table-head">
-      <label class="cell-check"><input type="checkbox" id="checkAll" /></label>
-      <div class="cell-name">名称</div>
-      <div class="cell-size">大小</div>
-      <div class="cell-time">修改时间</div>
-    </div>
-    <div id="tableBody" class="table-body" tabindex="0"></div>
-    <div id="loadingMask" class="loading-mask hidden">
-      <div class="spinner"></div>
-      <div>正在加载目录…</div>
-    </div>
-    <div id="dropOverlay" class="drop-overlay hidden">
-      <div class="drop-box">松开鼠标上传到当前目录</div>
-    </div>
-  </main>
+    <div id="treeSplitter" class="tree-splitter" title="拖动调整宽度"></div>
+    <button id="btnTreeExpand" class="tree-expand-btn hidden" title="展开目录树">»</button>
+
+    <main id="fileArea">
+      <!-- 工具栏 -->
+      <div id="toolbar">
+        <button class="tb-btn" id="btnUp" title="返回上一级 (Backspace)"><span class="ic">↑</span>上级</button>
+        <div class="tb-sep"></div>
+        <button class="tb-btn" id="btnUploadFiles" title="上传文件 (Ctrl+U)"><span class="ic">⤒</span>上传文件</button>
+        <button class="tb-btn" id="btnUploadFolder" title="上传文件夹 (Ctrl+Shift+U)"><span class="ic">⇪</span>上传文件夹</button>
+        <div class="tb-sep"></div>
+        <button class="tb-btn" id="btnDownload" title="下载选中项"><span class="ic">⤓</span>下载</button>
+        <button class="tb-btn" id="btnNewFolder" title="新建文件夹 (Ctrl+N)"><span class="ic">＋</span>新建文件夹</button>
+        <button class="tb-btn danger" id="btnDelete" title="删除选中项 (Delete)"><span class="ic">✕</span>删除</button>
+        <div class="tb-spacer"></div>
+        <button class="tb-btn" id="btnRefresh" title="刷新 (F5)"><span class="ic">↻</span>刷新</button>
+      </div>
+
+      <!-- 层级路径：点击任意一级跳转 -->
+      <nav id="breadcrumb" class="breadcrumb-bar" aria-label="目录位置"></nav>
+
+      <!-- 文件区 -->
+      <div class="table-head">
+        <label class="cell-check"><input type="checkbox" id="checkAll" /></label>
+        <div class="cell-name">名称</div>
+        <div class="cell-size">大小</div>
+        <div class="cell-time">修改时间</div>
+      </div>
+      <div id="tableBody" class="table-body" tabindex="0"></div>
+      <div id="loadingMask" class="loading-mask hidden">
+        <div class="spinner"></div>
+        <div>正在加载目录…</div>
+      </div>
+      <div id="dropOverlay" class="drop-overlay hidden">
+        <div class="drop-box">松开鼠标上传到当前目录</div>
+      </div>
+    </main>
+  </div>
 
   <!-- 传输面板 -->
   <section id="transferPanel" class="collapsed">

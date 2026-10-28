@@ -105,6 +105,35 @@ async function listDir(client, cfg, dir) {
   return { dirs: [...dirs.values()].sort(sortName), files: files.sort(sortName) };
 }
 
+/**
+ * 只列举子目录（供左侧目录树使用）。
+ * 不返回文件 —— 树只需要一层目录名，把文件也拉回来在万级目录下是纯浪费。
+ * 单层目录超过 maxKeys 时置 truncated，由调用方决定怎么提示。
+ */
+async function listDirs(client, cfg, dir, { maxKeys = 500 } = {}) {
+  const prefix = names.dirKey(cfg.prefix) + names.dirKey(dir);
+  const dirs = [];
+  let token;
+  do {
+    const res = await client.send(new ListObjectsV2Command({
+      Bucket: cfg.bucket,
+      Prefix: prefix,
+      Delimiter: '/',
+      ContinuationToken: token,
+      MaxKeys: maxKeys,
+    }));
+    for (const cp of res.CommonPrefixes || []) {
+      const rel = names.stripPrefix(cp.Prefix, cfg.prefix).replace(/\/+$/, '');
+      const name = names.basename(rel);
+      if (name) dirs.push({ name, key: rel });
+    }
+    token = res.IsTruncated ? res.NextContinuationToken : undefined;
+  } while (token && dirs.length < maxKeys);
+
+  const sortName = (a, b) => a.name.localeCompare(b.name, 'zh-Hans-CN');
+  return { dirs: dirs.sort(sortName), truncated: !!token || dirs.length > maxKeys };
+}
+
 /** 递归列举前缀下所有对象 key（相对 basePrefix），用于文件夹删除/统计。 */
 async function listAll(client, cfg, dir) {
   const prefix = names.dirKey(cfg.prefix) + names.dirKey(dir);
@@ -206,6 +235,7 @@ module.exports = {
   createClient,
   testConnection,
   listDir,
+  listDirs,
   listAll,
   deleteKeys,
   deleteDir,

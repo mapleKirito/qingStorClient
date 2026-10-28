@@ -6,6 +6,7 @@ const fs = require('node:fs');
 const { pathToFileURL } = require('node:url');
 
 const { ConfigStore } = require('./config');
+const { UiStateStore } = require('./uistate');
 const { TransferManager } = require('./transfers');
 const names = require('./names');
 const s3 = require('./s3');
@@ -24,6 +25,7 @@ if (SMOKE) {
 
 const configStore = new ConfigStore(app.getPath('userData'));
 const channelStore = new update.ChannelStore(app.getPath('userData'));
+const uiStateStore = new UiStateStore(app.getPath('userData'));
 const transfers = new TransferManager();
 let mainWindow = null;
 
@@ -268,6 +270,17 @@ function registerIpc() {
     return s3.listDir(client, cfg, String(dir || ''));
   });
 
+  // 目录树只拉子目录，不拉文件
+  ipcMain.handle('s3:listDirs', async (_e, dir) => {
+    const cfg = requireConfig();
+    const client = s3.createClient(cfg);
+    return s3.listDirs(client, cfg, String(dir || ''));
+  });
+
+  // 界面状态（树宽度 / 折叠 / 展开节点）
+  ipcMain.handle('uiState:get', () => uiStateStore.data);
+  ipcMain.handle('uiState:save', (_e, partial) => uiStateStore.save(partial || {}));
+
   ipcMain.handle('s3:mkdir', async (_e, dir) => {
     const cfg = requireConfig();
     const client = s3.createClient(cfg);
@@ -430,6 +443,7 @@ if (!gotLock) {
   app.whenReady().then(() => {
     configStore.load();
     channelStore.load();
+    uiStateStore.load();
     global.__qingCfg = configStore.isEmpty ? null : configStore.data;
     registerAppProtocol();
     registerIpc();

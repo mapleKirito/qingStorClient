@@ -66,20 +66,146 @@ button { font-family: var(--font); }
 .brand-name { font-size: 13.5px; font-weight: 600; letter-spacing: .2px; }
 .brand-sub { font-size: 11px; color: var(--dim); margin-top: 1px; }
 
-.breadcrumb {
+.top-actions { flex: none; display: flex; gap: 6px; margin-left: auto; }
+
+.icon-btn {
+  width: 30px; height: 30px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg2);
+  color: var(--dim);
+  font-size: 15px;
+  cursor: pointer;
+  transition: all .12s;
+}
+.icon-btn:hover { color: var(--text); border-color: var(--border2); background: var(--hover); }
+
+/* ---------------- 主体：目录树 + 文件区 ---------------- */
+#mainRow {
   flex: 1;
+  display: flex;
+  min-height: 0;
+}
+
+#treePanel {
+  width: var(--tree-w, 240px);
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  background: var(--bg2);
+  border-right: 1px solid var(--border);
+}
+#treePanel.collapsed { display: none; }
+
+.tree-head {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  height: 34px;
+  padding: 0 8px 0 12px;
+  border-bottom: 1px solid var(--border);
+  flex: none;
+}
+.tree-title {
+  flex: 1;
+  font-size: 11.5px;
+  color: var(--faint);
+  text-transform: uppercase;
+  letter-spacing: .4px;
+}
+
+.tree-body {
+  flex: 1;
+  overflow: auto;
+  padding: 6px 6px 14px;
+  outline: none;
+}
+.tree-body::-webkit-scrollbar { width: 10px; }
+.tree-body::-webkit-scrollbar-thumb { background: #2e3442; border-radius: 5px; border: 2px solid var(--bg2); }
+
+.tree-node {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  height: 26px;
+  padding-right: 8px;
+  border-radius: 5px;
+  color: var(--dim);
+  font-size: 12.5px;
+  white-space: nowrap;
+  cursor: default;
+  transition: background .1s, color .1s;
+}
+.tree-node:hover { background: var(--hover); color: var(--text); }
+.tree-node.current { background: var(--accent-soft); color: var(--text); }
+.tree-node.loading { opacity: .6; }
+
+.tn-caret {
+  width: 14px;
+  flex: none;
+  text-align: center;
+  font-size: 9px;
+  color: var(--faint);
+  transition: transform .12s;
+}
+.tn-caret.open { transform: rotate(90deg); }
+.tn-caret.leaf { visibility: hidden; }
+
+.tn-icon { flex: none; font-size: 12px; color: #8fb0ff; }
+.tn-name { overflow: hidden; text-overflow: ellipsis; }
+.tree-empty { padding: 10px 12px; font-size: 11.5px; color: var(--faint); }
+.tree-error { padding: 10px 12px; font-size: 11.5px; color: var(--red); }
+
+/* 拖拽分隔条：5px 命中区，平时透明 */
+.tree-splitter {
+  width: 5px;
+  flex: none;
+  margin-left: -3px;
+  cursor: col-resize;
+  position: relative;
+  z-index: 3;
+}
+.tree-splitter::after {
+  content: '';
+  position: absolute;
+  inset: 0 2px;
+  border-radius: 2px;
+  background: transparent;
+  transition: background .12s;
+}
+.tree-splitter:hover::after,
+body.resizing .tree-splitter::after { background: var(--accent); }
+body.resizing { cursor: col-resize; user-select: none; }
+#treePanel.collapsed ~ .tree-splitter { display: none; }
+
+/* 收起后贴左边缘的展开按钮 */
+.tree-expand-btn {
+  width: 14px;
+  flex: none;
+  border: none;
+  border-right: 1px solid var(--border);
+  background: var(--bg2);
+  color: var(--faint);
+  font-size: 11px;
+  cursor: pointer;
+  padding: 0;
+}
+.tree-expand-btn:hover { color: var(--text); background: var(--hover); }
+
+/* ---------------- 层级路径（文件区上方） ---------------- */
+.breadcrumb-bar {
   display: flex;
   align-items: center;
   gap: 2px;
+  height: 32px;
+  padding: 0 12px;
+  flex: none;
   overflow-x: auto;
   scrollbar-width: none;
-  background: var(--bg2);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  padding: 5px 10px;
-  min-height: 30px;
+  border-bottom: 1px solid var(--border);
 }
-.breadcrumb::-webkit-scrollbar { display: none; }
+.breadcrumb-bar::-webkit-scrollbar { display: none; }
 
 .crumb {
   color: var(--dim);
@@ -93,20 +219,6 @@ button { font-family: var(--font); }
 .crumb.current { color: var(--text); font-weight: 600; cursor: default; }
 .crumb.current:hover { background: transparent; }
 .crumb-sep { color: var(--faint); font-size: 11px; }
-
-.top-actions { flex: none; display: flex; gap: 6px; }
-
-.icon-btn {
-  width: 30px; height: 30px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: var(--bg2);
-  color: var(--dim);
-  font-size: 15px;
-  cursor: pointer;
-  transition: all .12s;
-}
-.icon-btn:hover { color: var(--text); border-color: var(--border2); background: var(--hover); }
 
 /* ---------------- 工具栏 ---------------- */
 #toolbar {
@@ -146,6 +258,7 @@ button { font-family: var(--font); }
 /* ---------------- 文件区 ---------------- */
 #fileArea {
   flex: 1;
+  min-width: 0;
   position: relative;
   display: flex;
   flex-direction: column;
@@ -538,6 +651,8 @@ button { font-family: var(--font); }
   color: var(--text);
 }
 .ctx-item:hover { background: var(--accent-soft); }
+.ctx-item.disabled { color: var(--faint); cursor: default; }
+.ctx-item.disabled:hover { background: transparent; }
 .ctx-item.danger { color: #ff8a87; }
 .ctx-item.danger:hover { background: rgba(239, 91, 88, .14); }
 .ctx-sep { height: 1px; background: var(--border); margin: 4px 6px; }
