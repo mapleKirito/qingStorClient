@@ -212,6 +212,18 @@ export function configDialog(current, { canCancel = true } = {}) {
 }
 
 /* ---------------- 右键菜单 ---------------- */
+
+// 当前的「点击外部即关闭」监听器。每次弹菜单前先卸掉上一份，
+// 否则多次弹菜单会累积监听器，一次外部点击就把新菜单关掉。
+let outsideHandler = null;
+
+function clearOutsideHandler() {
+  if (!outsideHandler) return;
+  window.removeEventListener('mousedown', outsideHandler, true);
+  window.removeEventListener('blur', outsideHandler);
+  outsideHandler = null;
+}
+
 export function showContextMenu(x, y, items) {
   closeContextMenu();
   const root = document.getElementById('ctxRoot');
@@ -234,14 +246,24 @@ export function showContextMenu(x, y, items) {
   const rect = menu.getBoundingClientRect();
   menu.style.left = Math.min(x, window.innerWidth - rect.width - 6) + 'px';
   menu.style.top = Math.min(y, window.innerHeight - rect.height - 6) + 'px';
-  setTimeout(() => {
-    window.addEventListener('mousedown', closeContextMenu, { once: true });
-    window.addEventListener('blur', closeContextMenu, { once: true });
-  }, 0);
+
+  // 关键：不能在 mousedown 时无条件关闭。
+  // mousedown 早于 click，一旦在这里把 #ctxRoot 清空，菜单项节点已被移除，
+  // 后续 click 不会派发到它身上 —— 表现就是「菜单能弹出，点任何项都只是消失」。
+  // 所以先看落点：点在菜单内就放过，click 才有机会执行。
+  outsideHandler = (e) => {
+    if (e.type === 'mousedown' && menu.contains(e.target)) return;
+    closeContextMenu();
+  };
+  // 用捕获阶段：即便菜单项内部对 mousedown 做了 stopPropagation，外部点击照样能关闭。
+  window.addEventListener('mousedown', outsideHandler, true);
+  window.addEventListener('blur', outsideHandler);
 }
 
 export function closeContextMenu() {
-  document.getElementById('ctxRoot').innerHTML = '';
+  clearOutsideHandler();
+  const root = document.getElementById('ctxRoot');
+  if (root) root.innerHTML = '';
 }
 
 /* ---------------- 更新相关弹窗 ---------------- */
