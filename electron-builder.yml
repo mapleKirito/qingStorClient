@@ -55,8 +55,13 @@ mac:
   category: public.app-category.productivity
   # 明确带上 ${arch}，x64 / arm64 两个 dmg 才不会互相覆盖
   artifactName: ${productName}-${version}-${arch}.${ext}
-  # 无 Apple 开发者证书：显式声明不签名，避免 electron-builder 去自动探测身份
-  identity: null
+  # 无 Apple 开发者证书，但有、且必须有 ad-hoc 签名（"-" 就是 ad-hoc）。
+  # 写 null 会让 electron-builder 完全跳过 codesign（MacTargetHelper 的 qualifier 分支只认 "-"），
+  # 而 Apple Silicon 的内核要求 arm64 二进制至少带一个有效签名，未签名的包会被直接判定
+  # 「已损坏」并杀掉进程，xattr -cr / 右键打开 / 系统设置放行都救不回来。
+  # ad-hoc 签名不等于受信任：浏览器下载后首次打开仍要走一次「仍要打开」放行；
+  # 应用内更新的包由主进程自己写盘、不带 quarantine，不会触发这一步。
+  identity: '-'
 
 linux:
   target:
