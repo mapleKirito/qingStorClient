@@ -191,7 +191,7 @@ function absoluteUrl(base, u) {
 /* ---------------- 检查更新 ---------------- */
 
 /**
- * GET /api/releases/latest?platform=win&arch=x64&channel=dev&current=0.0.1-dev
+ * GET /api/releases/latest?platform=win&arch=x64&channel=dev&current=1.0.0-dev
  *
  * 永远不抛异常：失败也返回 { ok:false, error }，调用方只管看 ok。
  * 服务端「该渠道没发过包」返回 latest:null / updateAvailable:false，这里照旧透出，
