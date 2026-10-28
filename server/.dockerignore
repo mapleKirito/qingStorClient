@@ -5,7 +5,7 @@
 #   admin-token.txt  管理令牌（相当于管理端密码）
 #   releases/        用户上传的安装包
 #
-# Dockerfile 用的是精确 COPY（只拷 package.json / server.js / admin.html），
+# Dockerfile 用的是精确 COPY（package.json / server.js / admin.html / storage/），
 # 所以 data/ 本来就不会进镜像；但构建上下文仍会被整体发给 daemon，
 # 一个几百 MB 的安装包目录会让每次构建都先卡传文件。这里一并挡掉。
 data/
@@ -14,8 +14,13 @@ data/
 *.db-shm
 admin-token.txt
 
+# 部署配置：含真实域名与对象存储密钥。
+# 运行期由 compose 的 environment 注入，不该烤进镜像，也不该进构建上下文。
+.env
+
 # 镜像发布脚本自己不参与构建
 docker-publish.sh
+docker-publish.ps1
 .dockerignore
 
 # 依赖与产物

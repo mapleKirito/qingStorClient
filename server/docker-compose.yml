@@ -1,12 +1,17 @@
 # =====================================================================
 # qingStorClient 更新服务 · docker compose
 # ---------------------------------------------------------------------
+# 运行参数全部集中在同目录的 .env（模板见 .env.example）：
+#   cp .env.example .env && vi .env && docker compose up -d
+#
+# 下面每处 ${VAR:-默认值} 都是「.env 优先、缺省回落」。所以 .env 不存在也能启动，
+# 会按默认值跑，默认值就等于此前硬编码在这里的那套配置。
+#
 # 关键点：两个端口都只发布到宿主机回环地址。
+#   - ${PORT}        给同机的 nginx 反代（proxy_pass http://127.0.0.1:8789）
+#   - ${ADMIN_PORT}  只给你自己的 SSH 隧道（ssh -L 8790:127.0.0.1:8790）
 #
-#   - 8789 给同机的 nginx 反代（proxy_pass http://127.0.0.1:8789）
-#   - 8790 只给你自己的 SSH 隧道（ssh -L 8790:127.0.0.1:8790）
-#
-# 端口刻意避开 8787/8788：同机上可能已经跑着 myApiTools 的服务端（占 8787），
+# 默认端口刻意避开 8787/8788：同机上可能已经跑着 myApiTools 的服务端（占 8787），
 # 撞了以后 publicServer 监听失败会 process.exit(1)，整个容器起不来。
 # server.js 的代码默认值仍是 8787/8788，这里用环境变量覆盖。
 #
@@ -28,10 +33,10 @@ services:
     #        然后 docker compose pull && docker compose up -d
     #
     #   阿里云 ACR —— 境内 ECS 首选，Docker Hub 经常拉不动
-    #     image: registry.cn-hangzhou.aliyuncs.com/myzhouye/qingstorclient-server:1.1.0
+    #     image: registry.cn-hangzhou.aliyuncs.com/myzhouye/qingstorclient-server:1.2.1
     #
     #   Docker Hub —— 境外或备选
-    #     image: myzhouye/qingstorclient-server:1.1.0
+    #     image: myzhouye/qingstorclient-server:1.2.1
     #
     #   tag 建议写固定版本号而不是 latest：docker images 能看出线上跑的是哪版，
     #   回滚只需改这一行。latest 会跟着 docker-publish 一起动，事后无法追溯。
@@ -42,31 +47,60 @@ services:
     restart: unless-stopped
 
     ports:
-      - "127.0.0.1:8789:8789"   # 更新 API → nginx
-      - "127.0.0.1:8790:8790"   # 管理端 → 只走 SSH 隧道
+      # 左右两侧都取同一个变量：改 .env 里的 PORT 一处就够，不会出现
+      # 「映射到 8789 但容器内还听 8787」这种对不上的情况。
+      - "127.0.0.1:${PORT:-8789}:${PORT:-8789}"          # 更新 API → nginx
+      - "127.0.0.1:${ADMIN_PORT:-8790}:${ADMIN_PORT:-8790}"  # 管理端 → 只走 SSH 隧道
 
     environment:
-      # 容器内监听端口，必须和上面 ports 右侧一致
-      PORT: "8789"
-      ADMIN_PORT: "8790"
+      # ---- 监听 ----
       # 容器内必须绑 0.0.0.0，否则端口映射进不来；
-      # 真正的隔离靠上面宿主机侧的 127.0.0.1 绑定。
-      HOST: "0.0.0.0"
-      ADMIN_HOST: "0.0.0.0"
-      TRUST_PROXY: "1"
-      # 对外访问前缀。填了以后 latest 接口返回的 downloadUrl 是绝对地址
-      # （https://域名/api/releases/download/12）；留空则只返回相对路径 /api/...
-      # ⚠️ 换成真实子域后再上线，否则客户端拿到的下载地址会指向 example.com
-      PUBLIC_ORIGIN: "https://update.example.com"
-      RELEASE_MAX_MB: "300"
-      RELEASE_CHANNEL: "stable"
+      # 真正的隔离靠上面宿主机侧的 127.0.0.1 绑定，不是靠这里改 127.0.0.1。
+      PORT: "${PORT:-8789}"
+      ADMIN_PORT: "${ADMIN_PORT:-8790}"
+      HOST: "${HOST:-0.0.0.0}"
+      ADMIN_HOST: "${ADMIN_HOST:-0.0.0.0}"
+
+      # ---- 对外访问 ----
+      # 填了以后 latest 接口返回绝对 downloadUrl（https://域名/api/releases/download/12）；
+      # 留空则只返回相对路径 /api/...
+      # ⚠️ 填你自己的更新服务域名，不要填对象存储域名，也不要留着 example 占位带上线。
+      PUBLIC_ORIGIN: "${PUBLIC_ORIGIN:-}"
+      TRUST_PROXY: "${TRUST_PROXY:-1}"
+
+      # ---- 发布 ----
+      RELEASE_MAX_MB: "${RELEASE_MAX_MB:-300}"
+      RELEASE_CHANNEL: "${RELEASE_CHANNEL:-stable}"
+
+      # ---- 管理端 ----
       # 容器内来自网桥网关（172.17.0.1 之类）的请求不是回环地址，
       # 需要在这里声明受信网段，否则管理端会一律拒绝。
-      ADMIN_ALLOW_CIDR: "172.16.0.0/12"
-      # 管理令牌不写在这里：让它自动生成到 data/admin-token.txt，
+      ADMIN_ALLOW_CIDR: "${ADMIN_ALLOW_CIDR:-172.16.0.0/12}"
+      # 令牌一般不写在这里：让它自动生成到 data/admin-token.txt，
       # 首次启动后 `docker exec qs-update cat /app/data/admin-token.txt` 取。
-      # 想自己定就取消下面两行注释（注意别把令牌提交进仓库）。
-      # ADMIN_TOKEN: "换成你自己的长随机串"
+      ADMIN_TOKEN: "${ADMIN_TOKEN:-}"
+      # 设 1 则整个管理侧不启动（纯公网部署、不开隧道时用）。
+      ADMIN_DISABLED: "${ADMIN_DISABLED:-}"
+
+      # ---- 存储 ----
+      # local（默认）= 安装包写 /app/data/releases
+      # s3           = 安装包写对象存储，本地库只记元信息，下载时现签临时地址
+      # 切换驱动不影响存量包：每条记录自带 storage 字段，按行走各自的驱动，
+      # 所以从 local 切到 s3 之后，之前发在本地盘上的包仍然能下载。
+      #
+      # ⚠ S3_ENDPOINT 必须是 S3 协议端点（形如 https://s3.<region>.<vendor>），
+      #   不是厂商控制台里那个不带 s3 的网页直链域名 —— 后者只认原生签名，会 401。
+      STORAGE_DRIVER: "${STORAGE_DRIVER:-local}"
+      S3_ENDPOINT: "${S3_ENDPOINT:-}"
+      S3_PUBLIC_ENDPOINT: "${S3_PUBLIC_ENDPOINT:-}"
+      S3_BUCKET: "${S3_BUCKET:-}"
+      S3_REGION: "${S3_REGION:-}"
+      S3_ACCESS_KEY: "${S3_ACCESS_KEY:-}"
+      S3_SECRET_KEY: "${S3_SECRET_KEY:-}"
+      S3_PREFIX: "${S3_PREFIX:-}"
+      S3_ALLOW_ROOT: "${S3_ALLOW_ROOT:-}"
+      S3_FORCE_PATH_STYLE: "${S3_FORCE_PATH_STYLE:-true}"
+      S3_SIGN_EXPIRES: "${S3_SIGN_EXPIRES:-300}"
 
     volumes:
       - ./data:/app/data

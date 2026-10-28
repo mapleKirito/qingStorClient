@@ -18,7 +18,7 @@ node server.js
 ```
 
 ```
-  qingStorClient 更新服务 v1.1.0
+  qingStorClient 更新服务 v1.2.1
   ------------------------------------------------------------------
   更新 API            http://127.0.0.1:8787/api/releases/latest
   ------------------------------------------------------------------
@@ -66,7 +66,7 @@ node server.js
 ### 1. `GET /`
 
 ```json
-{ "ok": true, "service": "qingstor-client-update", "name": "qingStorClient 更新服务", "version": "1.1.0", "scope": "仅分发客户端安装包，不提供账号、配置同步与第三方代理", "serverTime": 1793167849698 }
+{ "ok": true, "service": "qingstor-client-update", "name": "qingStorClient 更新服务", "version": "1.2.1", "scope": "仅分发客户端安装包，不提供账号、配置同步与第三方代理", "serverTime": 1793167849698 }
 ```
 
 服务自述。浏览器直接敲域名就能确认服务活着、版本多少，不必先记住 `/api/health`。
@@ -76,10 +76,12 @@ node server.js
 ### 2. `GET /api/health`
 
 ```json
-{ "ok": true, "service": "qingstor-client-update", "version": "1.1.0", "releases": 12, "uptime": 3600, "checkedAt": 1793097689079 }
+{ "ok": true, "service": "qingstor-client-update", "version": "1.2.1", "releases": 12, "storage": "local", "uptime": 3600, "checkedAt": 1793097689079 }
 ```
 
 给 nginx / 监控探活用。带发布数量与运行时长，用来判断库是否读得动；不含平台、架构、版本号等任何可推断业务的信息。
+
+`storage` 是当前**写新包**用的驱动名（`local` / `s3`）。加这个字段是为了让「以为切到对象存储、实际还在写本地盘」这种认知错位无处藏身——浏览器敲一下就知道。bucket、端点、密钥一概不进公网响应；如果启动自检失败，会额外出现 `"storageOk": false`，详情只在管理端和日志里。
 
 ### 3. `GET /api/releases/latest`
 
@@ -143,6 +145,21 @@ content-disposition: attachment; filename="QingStorClient-Setup-2.0.1-x64.exe"; 
 
 文件丢失返回 `410 Gone`（不是 404）—— 库里还有记录但磁盘上没了，这种情况要跟"记录不存在"区分开，管理端才知道要重新发布。
 
+**存储驱动为 `s3` 时行为不同：**
+
+| 请求 | 行为 |
+| --- | --- |
+| `GET` | `302` 到对象存储的短时预签名地址（默认 300 秒），带 `cache-control: no-store` |
+| `HEAD` | **不 302**，由服务端用本地库里的 `size` / `sha256` 直接回答 `200` |
+
+HEAD 必须本地回答，两个原因叠在一起：对象存储对匿名 HEAD 一律 `403`（连不存在的 key 也是 403，不是 404），而 SigV4 签名绑定 HTTP method —— GET 的签名不能用于 HEAD。
+
+预签名地址**不会**出现在 `downloadUrl` 里。那个链接会被复制、粘贴、缓存，几分钟后就失效。`downloadUrl` 永远指向本服务的 `/api/releases/download/:id`，签名只在收到这一次 GET 的瞬间生成。
+
+Range 由客户端跟随 302 后直接对对象存储发起（实测支持，返回 `206`）。
+
+如果这条记录存在对象存储里、但当前进程没配 `STORAGE_DRIVER=s3`（比如从 s3 切回了 local），会返回 `503 STORAGE_NOT_CONFIGURED`，而不是去本地目录找文件然后报 410。
+
 ### 管理端接口（仅管理口）
 
 都需要 `X-Admin-Token` 头。
@@ -177,7 +194,8 @@ content-disposition: attachment; filename="QingStorClient-Setup-2.0.1-x64.exe"; 
 > 早先还有一个可选的 `UPDATE_API_KEY` / `X-Api-Key` 开关，**已移除**。原因不只是"没多大用"：
 > 客户端的密钥来源是环境变量，打包后双击启动根本读不到，服务端一旦开启，所有已发布的客户端
 > 会在下次检查更新时全部 401，而用户没有任何自助修复的办法。真要控制未授权下载，用对象存储的
-> 预签名 URL（短 TTL、每次现签、无法长期复用），不要加静态密钥。
+> 预签名 URL（短 TTL、每次现签、无法长期复用），不要加静态密钥 —— 这条路在 `STORAGE_DRIVER=s3`
+> 下已经实现了，见「对象存储」一节。
 
 公网侧另有按 IP 的限流：查询 300 次/分钟，下载 60 次/分钟。目的是防扫描和防被当免费 CDN 刷，不是为了挡正常用户。
 
@@ -189,14 +207,22 @@ content-disposition: attachment; filename="QingStorClient-Setup-2.0.1-x64.exe"; 
 server/data/
 ├── releases.db          SQLite（WAL 模式，会有 -wal / -shm 两个伴生文件）
 ├── admin-token.txt      管理令牌，权限 0600（Windows 上 mode 不生效，靠目录 ACL）
-└── releases/            安装包本体
+├── tmp/                 上传中的临时文件（.part），超过 24 小时的在启动时清理
+└── releases/            安装包本体（仅 local 驱动）
     ├── stable/2.0.1/QingStorClient-Setup-2.0.1-x64.exe
     └── dev/2.1.0-beta.1/QingStorClient-2.1.0-beta.1-mac-arm64.dmg
 ```
 
-按 `渠道/版本/文件名` 分目录，`file_path` 在库里只存相对路径。下载时会二次校验解析结果仍在 `RELEASES_DIR` 内 —— 即使库被外部改脏，也读不出目录之外的文件。
+按 `渠道/版本/文件名` 分目录，`file_path` 在库里只存相对路径，且统一用正斜杠——早期版本在 Windows 上会写成 `stable\2.0.1\x.exe`，反斜杠进库之后拿到 Linux 容器里就永远找不到，启动时会自动修正这类历史数据。下载时会二次校验解析结果仍在 `RELEASES_DIR` 内 —— 即使库被外部改脏，也读不出目录之外的文件。
 
-备份只需要 `data/` 这一个目录。库要用 `sqlite3 .backup` 热备，WAL 模式下直接 `cp` 会拷到不完整状态（见 deploy/README.md）。
+`STORAGE_DRIVER=s3` 时 `releases/` 不再写入，但 `tmp/` 仍然要留着：上传先落临时文件，算完 sha256 才能签名发给对象存储。
+
+**备份范围随驱动变化：**
+
+- `local` → `data/` 一个目录
+- `s3` → `data/releases.db` + 对象存储里的 `<bucket>/<prefix>/`，两边都要备
+
+库要用 `sqlite3 .backup` 热备，WAL 模式下直接 `cp` 会拷到不完整状态（见 deploy/README.md）。
 
 ---
 
@@ -264,15 +290,15 @@ docker login registry.cn-hangzhou.aliyuncs.com
 
 | 情形 | 打的 tag |
 | --- | --- |
-| HEAD 上有 `server-v1.2.0` 标签，且与 `package.json` 一致 | `1.2.0` + `latest` |
+| HEAD 上有 `server-v1.2.1` 标签，且与 `package.json` 一致 | `1.2.1` + `latest` |
 | 没有服务端标签（客户端 `v*` 标签不算） | 用 `package.json` 的 `version`，规则同上 |
 | 版本含 `-`（如 `2.1.0-beta.1`） | 只打 `2.1.0-beta.1`，**不动 `latest`** |
 | 加 `--floating` | 正式版额外打 `1.2` 与 `1` |
 | 加 `--tag dev` | 额外再打一个 `dev` |
 
-服务端标签必须带 `server-v` 前缀，例如 `git tag server-v1.1.0`。**不要用裸 `v1.1.0`** —— 客户端发版也打 `v*`，两套版本号（客户端 0.0.x-dev / 服务端 1.1.0）共用同一个标签空间，混用会导致脚本读到客户端的版本号再与服务端 `package.json` 比对，直接报错退出。
+服务端标签必须带 `server-v` 前缀，例如 `git tag server-v1.2.1`。**不要用裸 `v1.2.1`** —— 客户端发版也打 `v*`，两套版本号（客户端 0.0.x-dev / 服务端 1.2.1）共用同一个标签空间，混用会导致脚本读到客户端的版本号再与服务端 `package.json` 比对，直接报错退出。
 
-服务端标签与 `package.json` 不一致时脚本**直接报错退出**，避免出现「标签写着 1.2.0、镜像却是 1.1.0」。
+服务端标签与 `package.json` 不一致时脚本**直接报错退出**，避免出现「标签写着 1.3.0、镜像却是 1.2.1」。
 
 其它常用选项：
 
@@ -289,13 +315,15 @@ docker login registry.cn-hangzhou.aliyuncs.com
 
 ## 环境变量
 
+**Docker 部署不用手写这些变量**：它们全在同目录的 `.env` 里（模板 `.env.example`，逐项带注释），`docker-compose.yml` 用 `${VAR:-默认值}` 读取。下表是裸机 / systemd 部署时直接传给进程的形式。
+
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
 | `PORT` | `8787` | 公网侧端口。**Docker/systemd 部署用 `8789`**（镜像已设），避开同机 myApiTools 占用的 8787 |
 | `HOST` | `0.0.0.0` | 公网侧绑定地址。裸机放 nginx 后面时可以设 `127.0.0.1`，让端口连内网都不暴露 |
 | `DATA_DIR` | `./data` | 数据根目录 |
 | `DB_FILE` | `$DATA_DIR/releases.db` | 数据库 |
-| `RELEASES_DIR` | `$DATA_DIR/releases` | 安装包目录 |
+| `RELEASES_DIR` | `$DATA_DIR/releases` | **local 驱动**的安装包根目录。s3 模式下不再写入 |
 | `PUBLIC_ORIGIN` | 空 | 如 `https://update.example.com`，用于生成绝对 `downloadUrl`。留空则 `downloadUrl` 只返回相对路径 `/api/releases/download/12`，由调用方自己拼域名 |
 | `TRUST_PROXY` | `0` | nginx 后面设 `1`，否则统计到的全是 `127.0.0.1` |
 | `RELEASE_MAX_MB` | `300` | 单包上限 |
@@ -306,6 +334,83 @@ docker login registry.cn-hangzhou.aliyuncs.com
 | `ADMIN_TOKEN_FILE` | `$DATA_DIR/admin-token.txt` | 令牌文件 |
 | `ADMIN_DISABLED` | — | 设 `1` 则管理侧不启动 |
 | `ADMIN_ALLOW_CIDR` | 空 | 容器部署用，额外受信网段 |
+| `STORAGE_DRIVER` | `local` | `local` / `s3`。决定**新发布**的包写到哪；存量记录按各自行里的 `storage` 读 |
+| `S3_ENDPOINT` | 空 | s3 模式必填。S3 协议端点，形如 `https://s3.<region>.<vendor>` |
+| `S3_PUBLIC_ENDPOINT` | 空 | 签发下载地址用的公网端点，留空复用 `S3_ENDPOINT` |
+| `S3_BUCKET` | 空 | s3 模式必填 |
+| `S3_PREFIX` | 空 | 相对 bucket 的公共前缀。**默认要求非空**，空值直接拒绝启动 |
+| `S3_ALLOW_ROOT` | — | 确实要写到 bucket 根时置 `1`，与空 `S3_PREFIX` 成对使用 |
+| `S3_REGION` | `us-east-1` | 签名 scope 里的 region |
+| `S3_ACCESS_KEY` / `S3_SECRET_KEY` | 空 | s3 模式必填 |
+| `S3_FORCE_PATH_STYLE` | `true` | bucket 在路径里。国内网关基本没有泛解析，不建议关 |
+| `S3_SIGN_EXPIRES` | `300` | 预签名有效期（秒） |
+
+### 对象存储（`STORAGE_DRIVER=s3`）
+
+把 `STORAGE_DRIVER` 改成 `s3` 并填好端点、bucket、region、密钥即可，客户端一行代码都不用改：
+
+```env
+STORAGE_DRIVER=s3
+S3_ENDPOINT=https://s3.<region>.<vendor>
+S3_BUCKET=<bucket>
+S3_REGION=<region>
+S3_ACCESS_KEY=...
+S3_SECRET_KEY=...
+S3_PREFIX=qingstorclient/releases
+```
+
+**数据库里永远不存前缀。** `releases.file_path` 一直是 `stable/2.0.1/xxx.exe` 这样的相对 key，前缀只在 `storage/s3.js` 内部拼接。所以换 bucket、换前缀、换服务商时，库一个字节都不用改，把对象搬过去即可；业务代码也拿不到完整 key，没有机会漏加前缀。
+
+**三条实测约束**
+
+1. `S3_ENDPOINT` 必须是 S3 协议域名（形如 `https://s3.<region>.<vendor>`）。厂商控制台或网页直链用的那个不带 `s3` 的域名是原生 API，只认厂商签名，AWS SigV4 打过去是 `401`。也不能签完再换域名——签名里 Host 参与计算。
+2. `S3_FORCE_PATH_STYLE` 默认 `true` 且不建议关。多数国产对象存储的 S3 网关没有 `<bucket>.<endpoint>` 的泛解析，关掉之后 DNS 都解析不了。
+3. 预签名只签 GET。该存储对匿名 HEAD 一律 `403`，而签名绑定 method，所以下载侧的 HEAD 必须由本地库回答（见上面「下载」一节）。
+
+**切换驱动不影响存量包**
+
+每条记录自带 `storage` 字段（`local` / `s3`），下载时按行分流：
+
+- 当前是 `s3`，库里还有老的 `local` 记录 → 照样从本地盘流式返回，老包不会失效
+- 当前是 `local`，库里有 `s3` 记录 → 返回 `503 STORAGE_NOT_CONFIGURED`，明确告知配置缺失，而不是伪装成 410 文件丢失
+
+**启动自检**
+
+s3 模式下启动会真的写一个 `<prefix>/.healthcheck` 再删掉。只做 `HeadBucket` 不够——很多凭据只授了读权限，等第一次上传安装包才 `403`，白等一次几百 MB。
+
+自检失败**不退出进程**（只有静态配置错误才 `exit 1`：缺 bucket、缺密钥、前缀非法、前缀为空且没开 `S3_ALLOW_ROOT`）。bucket 一时连不上时，让服务继续回答「查版本」，比容器反复重启更好——否则客户端从「能查到更新但下载失败」退化成「检查更新直接报错」。结果通过 `/api/health` 的 `storageOk` 暴露。
+
+**最小权限**
+
+前缀只能在代码里防手滑，硬隔离必须落在账号层。单独建子账号，只授这些：
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:PutObject", "s3:GetObject", "s3:DeleteObject"],
+      "Resource": "arn:aws:s3:::<bucket>/<prefix>/*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket"],
+      "Resource": "arn:aws:s3:::<bucket>",
+      "Condition": { "StringLike": { "s3:prefix": ["<prefix>/*"] } }
+    }
+  ]
+}
+```
+
+`Resource` 必须精确到 `bucket/prefix/*`，写成 `bucket/*` 就等于没隔离。阿里 OSS 用 RAM Policy（action 换成 `oss:*`），MinIO 用 `mc admin policy`，结构相同。
+
+**四个容易忽略的点**
+
+- **时钟偏差超过 15 分钟，签名全部失效。** 容器里挂 `/etc/localtime` 或确保宿主机 NTP 正常。
+- **公共读 bucket 下，预签名不提供额外保护。** 知道 key 的人永久可下。想让「必须签名才能下」真正生效，bucket 得设成私有；共用 bucket 显然做不到（会影响同桶其他使用者），所以**共用 bucket 只能做命名隔离，权限隔离必须独占 bucket**。
+- **备份范围变了。** s3 模式下安装包在对象存储，本地 `data/` 只剩库与令牌。备份策略要跟着改，否则只备了本地卷、以为对象存储里有，两头都可能落空。
+- **别把对象存储域名填进 `PUBLIC_ORIGIN`。** 那是拼 `downloadUrl` 的前缀，填错会得到 `https://s3.../api/releases/download/12` 这种不存在的地址。
 
 ---
 

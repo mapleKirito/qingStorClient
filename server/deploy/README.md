@@ -115,11 +115,19 @@ sudo systemctl status qs-update --no-pager
 
 ```bash
 cd server
+cp .env.example .env          # 首次部署先准备配置，端口与 PUBLIC_ORIGIN 都在这
+vi .env
 docker compose up -d --build
 
 # 首次启动后取管理令牌
 docker exec qs-update cat /app/data/admin-token.txt
 ```
+
+**运行参数全部在 `.env`**（模板 `.env.example`，每个变量都有中文注释）。`docker-compose.yml` 里统一写成 `${VAR:-默认值}`，所以：
+
+- `.env` 不存在也能启动，按默认值跑（默认值就是此前硬编码在 compose 里的 8789 / 8790）
+- 改端口只改 `.env` 一处，`ports` 映射和容器内监听值取自同一个变量，不会再出现「映射到 8789 而容器还在听 8787」
+- `.env` 已进 `.gitignore`，真实域名、对象存储密钥都放这里，不会被误提交；仓库里只有 `.env.example`
 
 或者拉已经发布好的镜像（更推荐，服务器上不用装构建工具链，也不必把源码放上去）。镜像仓库选 ACR —— 境内 ECS 拉 Docker Hub 经常超时：
 
@@ -128,7 +136,7 @@ docker exec qs-update cat /app/data/admin-token.txt
 cd server && ./docker-publish.sh
 
 # 服务器上把 compose 的 build 去掉，换成 image
-#   image: registry.cn-hangzhou.aliyuncs.com/myzhouye/qingstorclient-server:1.1.0
+#   image: registry.cn-hangzhou.aliyuncs.com/myzhouye/qingstorclient-server:1.2.1
 docker compose pull && docker compose up -d
 ```
 
@@ -139,7 +147,23 @@ docker compose pull && docker compose up -d
 1. **端口必须是 `127.0.0.1:8789:8789` 这种带前缀的写法。** 写成 `8789:8789` 时 docker 会直接监听 `0.0.0.0`，并且它插入的 iptables 规则优先于 ufw，`ufw deny` 也拦不住 —— 这是 docker 用户最常踩的坑。
 2. **容器里 `ADMIN_HOST` 必须设 `0.0.0.0`**，否则端口映射进不来；真正的隔离靠宿主机侧那个 `127.0.0.1` 绑定。同时因为容器内看到的来源是网桥网关而**不是**回环地址，`docker-compose.yml` 里给了 `ADMIN_ALLOW_CIDR=172.16.0.0/12`，否则管理端会一律拒绝。
 
-数据全部在 `server/data` 一个目录里（库 + 安装包 + 令牌），升级只要 `docker compose up -d --build`，卷不动。
+默认（`local`）数据全部在 `server/data` 一个目录里（库 + 安装包 + 令牌）；切到 `STORAGE_DRIVER=s3` 后安装包搬到对象存储，`data/` 只剩库与令牌。只改 `.env` 时不需要 `--build`，`docker compose up -d` 会重建容器把新变量注入进去。
+
+**切对象存储的完整步骤：**
+
+```bash
+vi .env       # STORAGE_DRIVER=s3，并填 S3_ENDPOINT / BUCKET / REGION / ACCESS_KEY / SECRET_KEY / PREFIX
+docker compose up -d
+
+# 确认驱动真的切过去了，别只看 compose 里的变量
+docker logs qs-update 2>&1 | grep -E "存储驱动|storage"
+#   存储驱动            s3 · <bucket>/<prefix>
+#   [storage] 自检通过：s3 · 已写入探针 <prefix>/.healthcheck
+
+curl -s https://update.example.com/api/health   # 应该出现 "storage":"s3"
+```
+
+自检失败**不会**让容器退出，只是 `/api/health` 会多一个 `"storageOk":false`。先看日志里的原始错误再修配置——直接重启是修不好的。
 
 ---
 
@@ -206,12 +230,13 @@ curl -s https://update.example.com/api/health
 curl -s "https://update.example.com/api/releases/latest?platform=win&arch=x64&current=2.0.0"
 
 # 下载并校验完整性
-curl -sO "https://update.example.com/api/releases/download/1"
+# 注意 -L：STORAGE_DRIVER=s3 时这个接口返回 302 跳到对象存储，不跟随只会拿到空响应
+curl -sL -o pkg.bin "https://update.example.com/api/releases/download/1"
 curl -sI "https://update.example.com/api/releases/download/1" | grep -i x-release-sha256
-sha256sum QingStorClient-Setup-2.0.1-x64.exe
+sha256sum pkg.bin
 
-# 断点续传
-curl -r 0-1023 -o part.bin "https://update.example.com/api/releases/download/1"
+# 断点续传（s3 模式下 302 之后由对象存储处理 Range，同样要 -L）
+curl -sL -r 0-1023 -o part.bin "https://update.example.com/api/releases/download/1"
 
 # 管理端在公网必须打不开（应该是 404，不是 401、不是 403）
 curl -s -o /dev/null -w '%{http_code}\n' https://update.example.com/admin
@@ -224,7 +249,7 @@ curl -s -o /dev/null -w '%{http_code}\n' https://update.example.com/api/admin/re
 
 ## 七、备份与恢复
 
-要备份的只有 `data/` 一个目录：
+**本地存储（默认）**：要备份的只有 `data/` 一个目录。
 
 ```bash
 # 库要热备份，别直接 cp .db 文件（WAL 模式下会拷到不完整状态）
@@ -232,7 +257,17 @@ sqlite3 data/releases.db ".backup '/backup/releases-$(date +%F).db'"
 tar czf /backup/releases-files-$(date +%F).tar.gz -C data releases
 ```
 
-恢复：把库和 `releases/` 目录放回去，重启服务即可。**管理令牌文件也一起备份**，否则恢复后要用新令牌重新登录。
+**对象存储（`STORAGE_DRIVER=s3`）**：安装包在 bucket 里，本地只剩库和令牌。
+
+```bash
+sqlite3 data/releases.db ".backup '/backup/releases-$(date +%F).db'"
+# 对象存储那侧用厂商的跨区域复制 / 版本控制，或者定期同步一份出来：
+#   mc mirror myminio/<bucket>/<prefix> /backup/objects
+```
+
+**两边都要备**。只备本地卷会丢安装包，只备对象存储会丢版本索引（`downloads` 计数、`notes`、发布时间全在库里），恢复后客户端查不到任何版本。
+
+恢复：把库和 `releases/` 目录（或对象存储里的对象）放回去，重启服务即可。**管理令牌文件也一起备份**，否则恢复后要用新令牌重新登录。
 
 ---
 
@@ -247,5 +282,11 @@ tar czf /backup/releases-files-$(date +%F).tar.gz -C data releases
 | 上传报「连接被中断」 | 隧道断了，或用了 `curl -d`（会把二进制改坏，必须 `--data-binary`） |
 | 下载很慢、磁盘一直在涨 | nginx 少了 `proxy_buffering off` |
 | 客户端拿到 `downloadUrl` 是相对路径 | 没设 `PUBLIC_ORIGIN`。设成 `https://update.example.com` 后返回绝对地址 |
+| 配了 S3 但 `/api/health` 里 `storage` 还是 `local` | `.env` 里 `STORAGE_DRIVER` 没改，或改完没重建容器。`docker compose up -d` 后看一眼启动横幅的「存储驱动」行 |
+| 上传报 `STORAGE_WRITE_FAILED` | 凭据 / 权限 / 端点不对。`docker logs qs-update` 里有对象存储返回的原始 HTTP 状态与错误体，`403` 多半是 `S3_ENDPOINT` 填成了不带 `s3` 的原生域名 |
+| 容器起不来，日志说「存储配置错误，拒绝启动」 | 缺 `S3_BUCKET` / `S3_ACCESS_KEY` / `S3_SECRET_KEY`，或 `S3_PREFIX` 为空却没设 `S3_ALLOW_ROOT=1` |
+| 下载跳到对象存储后 403 | 预签名过期（链接被保存太久），或 `S3_PUBLIC_ENDPOINT` 与实际访问域名不一致导致签名 Host 对不上 |
+| 下载报 `STORAGE_NOT_CONFIGURED` | 这条记录存在对象存储里，但当前进程没配 `STORAGE_DRIVER=s3`（例如从 s3 切回了 local）。改回去重启，那批包就能下 |
+| 对象存储报 `RequestTimeTooSkewed` / 签名莫名失效 | 容器时钟与对象存储偏差超过 15 分钟。挂 `/etc/localtime` 或修宿主机 NTP |
 | 统计出来的下载 IP 全是 127.0.0.1 | 反代后面没设 `TRUST_PROXY=1` |
 | 提示 SQLite experimental | Node 22 的正常警告，忽略 |

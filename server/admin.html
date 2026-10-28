@@ -119,6 +119,9 @@
   }
   .pill.stable { color: var(--ok); border-color: rgba(74,222,128,.3); background: rgba(74,222,128,.1); }
   .pill.dev { color: var(--warn); border-color: rgba(251,191,36,.3); background: rgba(251,191,36,.1); }
+  /* 存储标记：s3 用强调色，让「这一条到底在哪」一眼可辨 */
+  .pill.s3 { color: var(--accent); border-color: rgba(109,139,255,.3); background: rgba(109,139,255,.1); }
+  .pill.local { color: var(--text-3); }
   .fname { max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .empty { padding: 26px; text-align: center; color: var(--text-3); font-size: 12.5px; }
   .row-actions { display: flex; gap: 6px; justify-content: flex-end; }
@@ -224,7 +227,7 @@
     <table>
       <thead>
         <tr>
-          <th>渠道</th><th>版本</th><th>平台</th><th>文件</th>
+          <th>渠道</th><th>版本</th><th>平台</th><th>文件</th><th>存储</th>
           <th class="num">大小</th><th class="num">下载</th><th>发布时间</th><th></th>
         </tr>
       </thead>
@@ -312,9 +315,22 @@
     $('serverVersion').textContent = 'server v' + info.serverVersion;
     $('statMax').textContent = info.maxMb + ' MB';
     $('fChannel').value = info.defaultChannel || 'stable';
-    $('releasesHint').textContent =
-      '安装包目录：' + info.releasesDir +
+
+    // 存储位置直接摆出来。1.2.0 那会儿配了 S3 却仍写本地盘，
+    // 页面上没有任何地方能看出这一点 —— 这里就是那个坑的解药。
+    var st = info.storage || { driver: 'local', root: info.releasesDir };
+    var where = st.driver === 's3'
+      ? '对象存储 · ' + (st.bucket || '') + '/' + (st.prefix || '') + ' · ' + (st.endpoint || '')
+      : '本地磁盘 · ' + (st.root || info.releasesDir);
+
+    var hint = '存储：' + where +
       (info.publicOrigin ? ' · 对外地址：' + info.publicOrigin : '');
+
+    var bad = info.storageStatus && info.storageStatus.ok === false;
+    if (bad) hint += ' · ⚠ 自检未通过：' + (info.storageStatus.detail || '未知原因');
+
+    $('releasesHint').textContent = hint;
+    $('releasesHint').style.color = bad ? 'var(--danger)' : '';
   }
 
   $('gateBtn').onclick = function () {
@@ -355,6 +371,7 @@
           '<td class="mono">' + esc(r.version) + '</td>' +
           '<td>' + esc(r.platform) + ' · ' + esc(r.arch) + '</td>' +
           '<td class="fname mono" title="' + esc(r.fileName) + '">' + esc(r.fileName) + '</td>' +
+          '<td><span class="pill ' + esc(r.storage || 'local') + '">' + esc(r.storage || 'local') + '</span></td>' +
           '<td class="num">' + fmtBytes(r.size) + '</td>' +
           '<td class="num">' + r.downloads + '</td>' +
           '<td class="mono" style="color:var(--text-3)">' + fmtTime(r.publishedAt) + '</td>' +
@@ -375,8 +392,9 @@
         };
 
         tr.querySelector('[data-act="del"]').onclick = function () {
+          var whereDel = (r.storage === 's3') ? '对象存储里的对象' : '本地磁盘上的文件';
           if (!confirm('删除 ' + r.channel + '/' + r.version + ' ' + r.platform + '-' + r.arch +
-            ' ？\n文件会一并从磁盘删除，不可恢复。')) return;
+            ' ？\n会把' + whereDel + '一并删除，不可恢复。')) return;
           api('/releases/' + r.id, { method: 'DELETE' }).then(function () {
             toast('已删除');
             return load();

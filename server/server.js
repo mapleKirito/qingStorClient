@@ -48,6 +48,24 @@
  *   RELEASE_MAX_MB    单包上限（MB），默认 300
  *   RELEASE_CHANNEL   默认渠道，默认 stable
  *
+ * 存储
+ *   STORAGE_DRIVER    local（默认）| s3。决定**新发布**的包写到哪里；
+ *                     存量记录按各自行里的 storage 字段读，不受切换影响
+ *   RELEASES_DIR      local 驱动的根目录，默认 $DATA_DIR/releases
+ *   S3_ENDPOINT       S3 协议入口，形如 https://s3.<region>.<vendor>
+ *                     ⚠ 必须是带 s3 的那个域名；厂商控制台里不带 s3 的原生域名
+ *                       只认自家签名格式，AWS SigV4 打过去直接 401
+ *   S3_PUBLIC_ENDPOINT 可选。签发下载地址用的公网入口，留空复用 S3_ENDPOINT。
+ *                     仅当上传走内网地址、下载需要公网域名时才需要分开配
+ *   S3_BUCKET         必填
+ *   S3_PREFIX         相对 bucket 的公共前缀，默认要求非空（如 qingstorclient/releases）。
+ *                     想让对象落在 bucket 根必须同时设 S3_ALLOW_ROOT=1
+ *   S3_REGION         默认 us-east-1。厂商若是自定义 region（如 zw2）照填
+ *   S3_ACCESS_KEY / S3_SECRET_KEY   必填
+ *   S3_FORCE_PATH_STYLE  默认 true。bucket 出现在路径里；多数国内 S3 网关
+ *                        没有 <bucket>.<endpoint> 的泛解析，不能关
+ *   S3_SIGN_EXPIRES   预签名有效期（秒），默认 300
+ *
  * 管理端
  *   ADMIN_HOST        默认 127.0.0.1。改成 0.0.0.0 会让管理端暴露到网络，
  *                     此时仍有「来源必须是回环 / 受信网段」这道兜底，但强烈不建议改
@@ -71,6 +89,7 @@ const path = require('node:path');
 const fs = require('node:fs');
 const crypto = require('node:crypto');
 const { DatabaseSync } = require('node:sqlite');
+const { createStorage } = require('./storage');
 
 /**
  * 服务端版本号唯一来源是 server/package.json。
@@ -119,8 +138,67 @@ const ADMIN_ALLOW_CIDR = String(process.env.ADMIN_ALLOW_CIDR || '')
 
 const IS_INIT_ONLY = process.argv.includes('--init-only');
 
+/* ------------------------------------------------------------------ *
+ * 存储
+ *
+ * 库里 releases.file_path 永远存**相对 key**，例如
+ *   stable/2.0.1/QingStorClient-Setup-2.0.1-x64.exe
+ * 前缀（S3_PREFIX）只在 s3 驱动内部拼接，业务代码拿不到完整 key，
+ * 也就没有机会漏加前缀。换 bucket / 换前缀时数据库一个字节都不用改。
+ * ------------------------------------------------------------------ */
+const STORAGE_DRIVER = String(process.env.STORAGE_DRIVER || 'local').trim().toLowerCase();
+const TMP_DIR = path.join(DATA_DIR, 'tmp');
+
+/**
+ * local 实例无条件创建 —— 即便当前驱动是 s3，库里也可能还留着切换前的
+ * local 记录。下载按行里的 storage 字段分流，存量包不会因为切换驱动而失效。
+ */
+const LOCAL_STORAGE = createStorage({ driver: 'local', releasesDir: RELEASES_DIR });
+
+const STORAGE = (() => {
+  if (STORAGE_DRIVER === 'local') return LOCAL_STORAGE;
+  try {
+    return createStorage({
+      driver: STORAGE_DRIVER,
+      releasesDir: RELEASES_DIR,
+      s3: {
+        endpoint: process.env.S3_ENDPOINT,
+        publicEndpoint: process.env.S3_PUBLIC_ENDPOINT,
+        region: process.env.S3_REGION,
+        bucket: process.env.S3_BUCKET,
+        accessKey: process.env.S3_ACCESS_KEY,
+        secretKey: process.env.S3_SECRET_KEY,
+        prefix: process.env.S3_PREFIX,
+        // 默认 path-style：多数国内 S3 网关没有 <bucket>.<endpoint> 的泛解析
+        forcePathStyle: String(process.env.S3_FORCE_PATH_STYLE || 'true') !== 'false',
+        signExpires: process.env.S3_SIGN_EXPIRES,
+        allowRoot: String(process.env.S3_ALLOW_ROOT || '') === '1',
+      },
+    });
+  } catch (e) {
+    // 静态配置错误（缺 bucket / 缺密钥 / 前缀非法）不该带着跑：
+    // 这种状态上传必然全失败，早退出比线上发现早。
+    console.error('[storage] 存储配置错误，拒绝启动：' + e.message);
+    process.exit(1);
+  }
+})();
+
+/**
+ * 按记录行取驱动。
+ * 返回 null 表示「这一行要的对象存储，当前进程没配」——比如从 s3 切回 local
+ * 启动，库里仍有 s3 记录。此时明确报错，而不是去本地目录找文件后报 410。
+ */
+function storageFor(name) {
+  if (name === 's3') return STORAGE.name === 's3' ? STORAGE : null;
+  return LOCAL_STORAGE;
+}
+
+/** 启动自检结果。连通性问题不退出（详见启动段），但要能被 health / 管理端看见 */
+let storageStatus = { ok: null, detail: '尚未自检' };
+
 fs.mkdirSync(DATA_DIR, { recursive: true });
 fs.mkdirSync(RELEASES_DIR, { recursive: true });
+fs.mkdirSync(TMP_DIR, { recursive: true });
 
 /* ------------------------------------------------------------------ *
  * 管理令牌
@@ -179,7 +257,10 @@ db.exec(`
     notes         TEXT,
     downloads     INTEGER NOT NULL DEFAULT 0,
     published_at  INTEGER NOT NULL,
-    published_ip  TEXT
+    published_ip  TEXT,
+    -- 这条包存在哪里。历史记录一律 local，允许与当前 STORAGE_DRIVER 不同，
+    -- 这样切换驱动时存量包仍然可下载（按行走各自的驱动）
+    storage       TEXT    NOT NULL DEFAULT 'local'
   );
 
   CREATE UNIQUE INDEX IF NOT EXISTS uq_releases_key
@@ -197,13 +278,40 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_audit_at ON audit (at);
 `);
 
+/**
+ * 老库迁移。CREATE TABLE IF NOT EXISTS 不会给已存在的表补列，
+ * 所以 storage 列要单独检查后 ALTER。
+ */
+const releaseColumns = db.prepare('PRAGMA table_info(releases)').all();
+if (!releaseColumns.some((c) => c.name === 'storage')) {
+  db.exec("ALTER TABLE releases ADD COLUMN storage TEXT NOT NULL DEFAULT 'local'");
+  console.log('[migrate] releases 新增 storage 列，存量记录标记为 local');
+}
+
+/**
+ * 历史脏数据修复：1.2.0 及更早版本用 path.join(channel, version) 生成 file_path，
+ * 在 Windows 上会写成 `stable\2.0.1\xxx.exe`。反斜杠一旦进库，拿到 Linux 容器里
+ * 就永远找不到文件（且 s3 的对象 key 会变成一个带反斜杠的怪名字）。
+ * 这里统一改成正斜杠 —— 幂等，重复执行无副作用。
+ */
+try {
+  db.exec(
+    "UPDATE releases SET file_path = REPLACE(file_path, char(92), '/') " +
+    'WHERE instr(file_path, char(92)) > 0'
+  );
+  const n = Number(db.prepare('SELECT changes() AS n').get().n || 0);
+  if (n) console.log(`[migrate] 修正 ${n} 条记录的 file_path 路径分隔符`);
+} catch (e) {
+  console.error('[migrate] 修正 file_path 失败（不影响启动）：', e.message);
+}
+
 const stmt = {
   insertRelease: db.prepare(`
-    INSERT INTO releases (channel, version, platform, arch, file_name, file_path, size, sha256, notes, downloads, published_at, published_ip)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+    INSERT INTO releases (channel, version, platform, arch, file_name, file_path, size, sha256, notes, downloads, published_at, published_ip, storage)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
   `),
   overwriteRelease: db.prepare(`
-    UPDATE releases SET file_name = ?, file_path = ?, size = ?, sha256 = ?, notes = ?, published_at = ?, published_ip = ?
+    UPDATE releases SET file_name = ?, file_path = ?, size = ?, sha256 = ?, notes = ?, published_at = ?, published_ip = ?, storage = ?
     WHERE id = ?
   `),
   findReleaseById: db.prepare('SELECT * FROM releases WHERE id = ?'),
@@ -222,7 +330,11 @@ const stmt = {
 
 if (IS_INIT_ONLY) {
   console.log('[init] 数据库已就绪：' + DB_FILE);
-  console.log('[init] 安装包目录：' + RELEASES_DIR);
+  const sd = STORAGE.describe();
+  console.log(
+    '[init] 存储驱动：' + sd.driver +
+    (sd.driver === 's3' ? ` · ${sd.bucket}/${sd.prefix} @ ${sd.endpoint}` : ' · ' + sd.root)
+  );
   process.exit(0);
 }
 
@@ -491,6 +603,7 @@ function releaseRowToJson(row) {
     notes: row.notes || '',
     downloads: row.downloads,
     publishedAt: row.published_at,
+    storage: row.storage || 'local',
     downloadUrl: PUBLIC_ORIGIN ? PUBLIC_ORIGIN + rel : rel,
   };
 }
@@ -535,21 +648,32 @@ function handleServiceInfo(req, res, isAdmin) {
     scope: '仅分发客户端安装包，不提供账号、配置同步与第三方代理',
     serverTime: Date.now(),
   };
-  // 管理侧根路径额外给出入口提示：从隧道里敲根路径之后，知道下一步该点哪
-  if (isAdmin) info.adminPage = '/admin';
+  // 管理侧根路径额外给出入口提示与存储位置：从隧道里敲根路径之后，
+  // 既知道下一步点哪，也能立刻确认「现在包到底写在哪」
+  if (isAdmin) {
+    info.adminPage = '/admin';
+    info.storage = STORAGE.describe();
+  }
   send(res, 200, info);
 }
 
 /** GET /api/health —— 给 nginx / 监控探活用，带发布数量与运行时长（用来判断库是否读得动） */
 function handleHealth(req, res) {
-  send(res, 200, {
+  const payload = {
     ok: true,
     service: 'qingstor-client-update',
     version: VERSION,
     releases: stmt.countReleases.get().n,
+    // 只暴露驱动名。加这个字段是为了让「以为切到对象存储、实际还在写本地盘」
+    // 这种认知错位无处藏身 —— 浏览器敲一下 health 就能确认。bucket、端点、
+    // 密钥一概不进公网响应。
+    storage: STORAGE.name,
     uptime: Math.round(process.uptime()),
     checkedAt: Date.now(),
-  });
+  };
+  // 自检失败要让监控看得见；失败详情只留在管理端与日志里
+  if (storageStatus.ok === false) payload.storageOk = false;
+  send(res, 200, payload);
 }
 
 /** GET /api/releases/latest?platform=win&arch=x64&channel=stable&current=2.0.0 */
@@ -635,11 +759,71 @@ function bumpDownloads(req, id, rangeStart) {
   try { stmt.bumpDownloads.run(id); } catch { /* 计数失败不该影响下载 */ }
 }
 
-/** GET /api/releases/download/:id —— 流式返回安装包，支持 Range */
-function handleReleaseDownload(req, res, id) {
-  const row = stmt.findReleaseById.get(id);
-  if (!row) return fail(res, 404, '安装包不存在', 'NOT_FOUND');
+/** 下载响应的公共头，local 与 s3 两条路径共用 */
+function downloadHeaders(row) {
+  return {
+    'content-type': 'application/octet-stream',
+    'accept-ranges': 'bytes',
+    'content-disposition':
+      `attachment; filename="${asciiFileName(row.file_name)}"; ` +
+      `filename*=UTF-8''${encodeURIComponent(row.file_name)}`,
+    'x-release-version': row.version,
+    'x-release-platform': row.platform,
+    'x-release-arch': row.arch,
+    'x-release-sha256': row.sha256,
+    'x-release-storage': row.storage || 'local',
+    'cache-control': 'no-store',
+  };
+}
 
+/**
+ * 对象存储分支：GET 返 302 到短时预签名地址，HEAD 由本地库直接回答。
+ *
+ * 为什么不把预签名地址放进 downloadUrl 让客户端直接用：
+ *   那个链接会出现在弹窗、复制按钮、聊天记录里，几分钟后就过期。
+ *   downloadUrl 永远指向本服务的 /api/releases/download/:id，
+ *   预签名只在收到这次 GET 的瞬间生成，TTL 可以压到 5 分钟，泄露面最小。
+ */
+function downloadFromObjectStorage(req, res, row) {
+  const target = storageFor('s3');
+  if (!target) {
+    return fail(
+      res, 503,
+      '该安装包存放在对象存储，但当前服务未配置 STORAGE_DRIVER=s3',
+      'STORAGE_NOT_CONFIGURED'
+    );
+  }
+
+  // HEAD 必须由服务端自己回答：匿名 HEAD 在该存储上一律 403（连不存在的 key 也是），
+  // 而 SigV4 签名绑定 method，GET 的签名不能用于 HEAD。size / sha256 本地库里都有。
+  if (req.method === 'HEAD') {
+    res.writeHead(200, { ...downloadHeaders(row), 'content-length': row.size });
+    return res.end();
+  }
+
+  let url;
+  try {
+    url = target.signedUrl(row.file_path);
+  } catch (e) {
+    console.error('[download] 生成预签名地址失败：', e.message);
+    return fail(res, 502, '生成下载地址失败：' + e.message, 'SIGN_FAILED');
+  }
+  if (!url) return fail(res, 500, '当前存储驱动不支持临时下载地址', 'STORAGE_UNSUPPORTED');
+
+  bumpDownloads(req, row.id, 0);
+  // 302 响应体为空。no-store 很关键：任何中间层缓存了这张带过期签名的跳转都很难查
+  res.writeHead(302, {
+    location: url,
+    'cache-control': 'no-store',
+    'x-release-version': row.version,
+    'x-release-sha256': row.sha256,
+    'x-release-storage': 's3',
+  });
+  res.end();
+}
+
+/** 本地磁盘分支：流式返回，支持 Range（断点续传） */
+function downloadFromLocalDisk(req, res, row) {
   const full = path.resolve(RELEASES_DIR, row.file_path);
   // 双保险：即使库被外部改脏，也不允许把 RELEASES_DIR 之外的文件读出去
   if (full !== RELEASES_DIR && !full.startsWith(RELEASES_DIR + path.sep)) {
@@ -653,18 +837,7 @@ function handleReleaseDownload(req, res, id) {
     return fail(res, 410, '安装包文件已丢失，请在管理端重新发布', 'GONE');
   }
 
-  const baseHeaders = {
-    'content-type': 'application/octet-stream',
-    'accept-ranges': 'bytes',
-    'content-disposition':
-      `attachment; filename="${asciiFileName(row.file_name)}"; ` +
-      `filename*=UTF-8''${encodeURIComponent(row.file_name)}`,
-    'x-release-version': row.version,
-    'x-release-platform': row.platform,
-    'x-release-arch': row.arch,
-    'x-release-sha256': row.sha256,
-    'cache-control': 'no-store',
-  };
+  const baseHeaders = downloadHeaders(row);
 
   const rangeHeader = req.headers.range;
   if (rangeHeader) {
@@ -693,6 +866,15 @@ function handleReleaseDownload(req, res, id) {
   const stream = fs.createReadStream(full);
   stream.on('error', () => res.destroy());
   stream.pipe(res);
+}
+
+/** GET /api/releases/download/:id —— 按记录行里的 storage 分流 */
+function handleReleaseDownload(req, res, id) {
+  const row = stmt.findReleaseById.get(id);
+  if (!row) return fail(res, 404, '安装包不存在', 'NOT_FOUND');
+  return row.storage === 's3'
+    ? downloadFromObjectStorage(req, res, row)
+    : downloadFromLocalDisk(req, res, row);
 }
 
 /* ------------------------------------------------------------------ *
@@ -780,10 +962,12 @@ async function adminUploadRelease(req, res, url) {
   const safeName =
     sanitizeFileName(declared) || defaultFileName(version, platform, arch);
 
-  const relDir = path.join(channel, version);
-  const relPath = path.join(relDir, safeName);
-  const absDir = path.join(RELEASES_DIR, relDir);
-  const absPath = path.join(RELEASES_DIR, relPath);
+  // key 一律用正斜杠拼接。path.join 在 Windows 上会产出 `stable\2.0.1\x.exe`，
+  // 反斜杠一旦进库，拿到 Linux 容器或对象存储里就永远找不到（1.2.0 遗留的真实隐患）。
+  const relPath = [channel, version, safeName].join('/');
+  // 先落临时文件：对象存储的 SigV4 要求请求头里带整包 SHA256，
+  // 而签名必须在发请求之前完成 —— 所以哈希得先算完，只能两遍 IO。
+  const tmpFile = path.join(TMP_DIR, `up-${Date.now()}-${crypto.randomBytes(6).toString('hex')}.part`);
 
   // 先按 Content-Length 拦一道：正常上传都会带这个头，能不读 body 就拒掉
   const declaredLen = Number(req.headers['content-length'] || 0);
@@ -791,20 +975,19 @@ async function adminUploadRelease(req, res, url) {
     return fail(res, 413, `安装包超过上限 ${RELEASE_MAX_MB} MB`, 'TOO_LARGE');
   }
 
-  fs.mkdirSync(absDir, { recursive: true });
+  fs.mkdirSync(TMP_DIR, { recursive: true });
 
   /**
-   * 上传失败时的收尾：删掉半截文件，再尝试删掉空目录。
-   * 目录可能本来就有（覆盖发布），所以 rmdir 失败是正常情况，直接忽略。
-   * 不清理的话，每次失败的上传都会在 releases 下留一个空的版本目录。
+   * 上传失败时的收尾：删掉半截的临时文件。
+   * 正式位置由存储驱动负责 —— 形态是本地文件还是对象存储都不知道，
+   * 所以业务层只管临时文件，失败的半截数据永远进不了 releases 目录。
    */
   const discardPartial = () => {
-    try { fs.rmSync(absPath, { force: true }); } catch { /* ignore */ }
-    try { fs.rmdirSync(absDir); } catch { /* 非空或不存在，忽略 */ }
+    try { fs.rmSync(tmpFile, { force: true }); } catch { /* ignore */ }
   };
 
   const hash = crypto.createHash('sha256');
-  const ws = fs.createWriteStream(absPath);
+  const ws = fs.createWriteStream(tmpFile);
   let size = 0;
   let tooBig = false;
   let failure = null;
@@ -867,19 +1050,54 @@ async function adminUploadRelease(req, res, url) {
   const ip = clientIp(req);
   const existing = stmt.findReleaseByKey.get(channel, version, platform, arch);
 
+  /**
+   * 顺序不能反：先把对象写进存储，成功后才动数据库。
+   * 反过来会出现「库里有记录、对象不存在」——客户端看到有新版本，下载却 404，
+   * 而且从管理端看不出问题。失败就宁可不写库，让这次发布整体失败。
+   */
+  try {
+    await STORAGE.put(relPath, tmpFile, { size, sha256, contentType: 'application/octet-stream' });
+  } catch (e) {
+    discardPartial();
+    console.error('[upload] 写入存储失败：', e.message);
+    return fail(res, 502, '写入存储失败：' + e.message, 'STORAGE_WRITE_FAILED');
+  }
+  // local 驱动是 rename（临时文件已被移走），s3 驱动需要这里收拾；
+  // force 删除对不存在的文件无副作用
+  try { fs.rmSync(tmpFile, { force: true }); } catch { /* ignore */ }
+
+  /**
+   * 覆盖发布：新对象就位之后再清理旧对象。
+   * 同一个「渠道+版本+平台+架构」重复发布按覆盖处理 —— 这是自建服务比
+   * GitHub Release 好用的地方：dev 渠道可以无脑重发，不会堆十几个同版本垃圾。
+   * 指向同一个存储的同一个 key 时不用删（刚写的那个就是它）。
+   */
+  if (existing) {
+    const oldStorage = existing.storage || 'local';
+    const oldPath = String(existing.file_path || '').replace(/\\/g, '/');
+    const sameTarget = oldStorage === STORAGE.name && oldPath === relPath;
+    if (!sameTarget) {
+      const oldStore = storageFor(oldStorage);
+      if (oldStore) {
+        try { await oldStore.remove(oldPath); }
+        catch (e) { console.error('[upload] 清理旧对象失败（不影响本次发布）：', e.message); }
+      } else {
+        console.warn(
+          `[upload] 旧记录存放在 ${oldStorage}，当前未配置该驱动，旧对象未清理：${oldPath}`
+        );
+      }
+    }
+  }
+
   let id;
   if (existing) {
-    // 同一个「渠道+版本+平台+架构」重复发布按覆盖处理，顺手删掉旧文件，
-    // 免得反复重发把磁盘堆满 —— 这也是自建服务比 GitHub Release 好用的地方：
-    // dev 渠道可以无脑重发，不会留下十几个同版本号的垃圾。
-    if (existing.file_path !== relPath) {
-      try { fs.rmSync(path.resolve(RELEASES_DIR, existing.file_path), { force: true }); } catch { /* ignore */ }
-    }
-    stmt.overwriteRelease.run(safeName, relPath, size, sha256, notes || existing.notes, now, ip, existing.id);
+    stmt.overwriteRelease.run(
+      safeName, relPath, size, sha256, notes || existing.notes, now, ip, STORAGE.name, existing.id
+    );
     id = existing.id;
   } else {
     const r = stmt.insertRelease.run(
-      channel, version, platform, arch, safeName, relPath, size, sha256, notes || null, now, ip
+      channel, version, platform, arch, safeName, relPath, size, sha256, notes || null, now, ip, STORAGE.name
     );
     id = Number(r.lastInsertRowid);
   }
@@ -906,20 +1124,38 @@ function adminListReleases(req, res, query) {
     defaultChannel: DEFAULT_CHANNEL,
     publicOrigin: PUBLIC_ORIGIN || null,
     channels: [...new Set(stmt.listReleases.all(500, 0).map((r) => r.channel))],
+    storage: STORAGE.describe(),
+    storageStatus,
     releasesDir: RELEASES_DIR,
     releases: stmt.listReleases.all(limit, offset).map(releaseRowToJson),
   });
 }
 
-function adminDeleteRelease(req, res, id) {
+async function adminDeleteRelease(req, res, id) {
   const row = stmt.findReleaseById.get(id);
   if (!row) return fail(res, 404, '发布记录不存在', 'NOT_FOUND');
 
+  const target = storageFor(row.storage || 'local');
+  if (!target) {
+    return fail(
+      res, 503,
+      `该记录存放在 ${row.storage}，当前服务未配置该驱动，无法删除对象`,
+      'STORAGE_NOT_CONFIGURED'
+    );
+  }
+
+  /**
+   * 先删对象、再删库。对象删不掉就不动库 —— 否则会留下一条指向空对象的记录，
+   * 客户端拿到 410，而管理端列表看起来一切正常，很难定位。
+   */
+  try {
+    await target.remove(row.file_path);
+  } catch (e) {
+    console.error('[delete] 删除存储对象失败：', e.message);
+    return fail(res, 502, '删除存储对象失败：' + e.message, 'STORAGE_DELETE_FAILED');
+  }
+
   stmt.deleteRelease.run(id);
-  const abs = path.resolve(RELEASES_DIR, row.file_path);
-  try { fs.rmSync(abs, { force: true }); } catch { /* ignore */ }
-  // 顺手清掉空掉的版本目录，失败无所谓
-  try { fs.rmdirSync(path.dirname(abs)); } catch { /* ignore */ }
 
   audit(req, 'release.delete', `${row.channel}/${row.version} ${row.platform}-${row.arch} ${row.file_name}`);
   send(res, 200, { ok: true, deleted: releaseRowToJson(row) });
@@ -980,6 +1216,19 @@ function handlePublic(req, res) {
   return notFound(res);
 }
 
+/**
+ * async handler 的兜底。
+ * 上传/删除现在会 await 存储驱动，异常不会再被同步 try/catch 抓住，
+ * 不加这层就是 unhandledRejection —— 进程可能直接挂，而客户端只看到连接被重置。
+ */
+function guardAsync(res, p) {
+  return Promise.resolve(p).catch((e) => {
+    console.error('[admin] 异步处理未捕获异常：', e);
+    if (!res.headersSent) fail(res, 500, '服务端内部错误', 'INTERNAL');
+    else res.destroy();
+  });
+}
+
 function handleAdminSide(req, res) {
   const url = new URL(req.url, 'http://localhost');
   const p = url.pathname;
@@ -1023,6 +1272,8 @@ function handleAdminSide(req, res) {
       maxMb: RELEASE_MAX_MB,
       defaultChannel: DEFAULT_CHANNEL,
       publicOrigin: PUBLIC_ORIGIN || null,
+      storage: STORAGE.describe(),
+      storageStatus,
     });
   }
 
@@ -1030,12 +1281,16 @@ function handleAdminSide(req, res) {
     if (req.method === 'GET' || req.method === 'HEAD') return adminListReleases(req, res, url.searchParams);
     // PUT 是语义正确的写法；同时接受 POST，因为不少工具（Postman、各种 HTTP 库）
     // 默认就是 POST，硬性拒绝只会让人以为接口坏了
-    if (req.method === 'PUT' || req.method === 'POST') return adminUploadRelease(req, res, url);
+    if (req.method === 'PUT' || req.method === 'POST') {
+      return guardAsync(res, adminUploadRelease(req, res, url));
+    }
     return fail(res, 405, '该接口只接受 GET / PUT（也接受 POST）', 'BAD_METHOD');
   }
 
   const m = /^\/api\/admin\/releases\/(\d+)$/.exec(p);
-  if (m && req.method === 'DELETE') return adminDeleteRelease(req, res, Number(m[1]));
+  if (m && req.method === 'DELETE') {
+    return guardAsync(res, adminDeleteRelease(req, res, Number(m[1])));
+  }
 
   if (p === '/api/admin/audit' && req.method === 'GET') {
     return adminListAudit(req, res, url.searchParams);
@@ -1094,17 +1349,75 @@ function banner() {
   } else {
     line('管理端', '已关闭');
   }
-  line('安装包目录', RELEASES_DIR);
+  const sd = STORAGE.describe();
+  if (sd.driver === 's3') {
+    line('存储驱动', `s3 · ${sd.bucket}/${sd.prefix}`);
+    line('对象存储', sd.endpoint + (sd.publicEndpoint !== sd.endpoint ? `  →  ${sd.publicEndpoint}` : ''));
+    line('预签名 TTL', `${sd.signExpires}s`);
+  } else {
+    line('存储驱动', 'local');
+    line('安装包目录', sd.root);
+  }
   line('数据库', DB_FILE);
   line('TRUST_PROXY', TRUST_PROXY ? '1（采信 X-Forwarded-For）' : '0（用 socket 地址）');
   console.log('  ' + '-'.repeat(66));
   console.log('');
 }
 
+/** 清理上次进程崩溃留下的半截上传文件（只动 24 小时前的，避免误删正在传的） */
+function cleanupTmpDir() {
+  try {
+    const cutoff = Date.now() - 24 * 3600 * 1000;
+    for (const name of fs.readdirSync(TMP_DIR)) {
+      if (!name.endsWith('.part')) continue;
+      const p = path.join(TMP_DIR, name);
+      try {
+        if (fs.statSync(p).mtimeMs < cutoff) fs.rmSync(p, { force: true });
+      } catch { /* ignore */ }
+    }
+  } catch { /* ignore */ }
+}
+
+/**
+ * 存储自检。连通性失败**不退出进程**：
+ * 静态配置错误在创建驱动时已经 exit(1)，而「bucket 一时连不上」如果也退出，
+ * 容器会反复重启 —— 连查版本接口都没了，客户端从「能查到更新但下载失败」
+ * 退化成「检查更新直接报错」，反而更糟。
+ * 所以这里只告警并置状态，由 /api/health 的 storageOk 暴露给监控。
+ */
+async function runStorageSelfCheck() {
+  try {
+    storageStatus = await STORAGE.ready();
+  } catch (e) {
+    storageStatus = { ok: false, detail: e.message };
+  }
+  if (storageStatus.ok) {
+    console.log('[storage] 自检通过：' + STORAGE.name + ' · ' + storageStatus.detail);
+  } else {
+    console.error(
+      '[storage] 自检失败（服务继续运行，但上传/下载可能不可用）：' + storageStatus.detail
+    );
+  }
+}
+
 publicServer.on('error', (e) => {
   console.error(`[public] 监听 ${HOST}:${PORT} 失败：`, e.message);
   process.exit(1);
 });
+
+/**
+ * 启动信息只打一次。管理端端口被占用时 listen 的成功回调不会触发，
+ * 如果不在这里兜一下，控制台会一片空白，看起来像是启动卡住了。
+ */
+let startupLogged = false;
+function logStartup() {
+  if (startupLogged) return;
+  startupLogged = true;
+  banner();
+  runStorageSelfCheck();
+}
+
+cleanupTmpDir();
 
 publicServer.listen(PORT, HOST, () => {
   if (ADMIN_ENABLED) {
@@ -1121,10 +1434,11 @@ publicServer.listen(PORT, HOST, () => {
       // 管理端起不来不该拖死更新 API：公网侧照常服务，只是没法发新版
       console.error(`[admin] 监听 ${ADMIN_HOST}:${ADMIN_PORT} 失败，管理端不可用：`, e.message);
       adminServer = null;
+      logStartup();
     });
-    adminServer.listen(ADMIN_PORT, ADMIN_HOST, banner);
+    adminServer.listen(ADMIN_PORT, ADMIN_HOST, logStartup);
   } else {
-    banner();
+    logStartup();
   }
 });
 

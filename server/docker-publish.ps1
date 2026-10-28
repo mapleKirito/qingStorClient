@@ -16,7 +16,7 @@
       .\docker-publish.ps1 -Help
 
     tag 自动识别：版本号取 server/package.json，并自动与 git 上 HEAD 的服务端标签
-    （server-vX.Y.Z）互相校验，不一致直接拒绝，避免「标签写着 1.1.0、镜像却是 1.0.0」。
+    （server-vX.Y.Z）互相校验，不一致直接拒绝，避免「标签写着 1.2.1、镜像却是 1.2.0」。
     只认 server-v* 前缀：客户端发版标签 v* 是另一套版本号，不参与校验。
 
     与 sh 版的 Windows 差异：
@@ -30,7 +30,7 @@
 
 .EXAMPLE
     .\docker-publish.ps1 -NoPush
-    只在本地构建出 qingstorclient-server:1.1.0，配合 docker compose up -d 用。
+    只在本地构建出 qingstorclient-server:1.2.1，配合 docker compose up -d 用。
 #>
 [CmdletBinding()]
 param(
@@ -349,8 +349,8 @@ function Get-BumpedVersion {
 # 否则返回空。
 #
 # 为什么必须限定 server-v 前缀：客户端与服务端是两套独立版本号（客户端 0.0.x-dev、
-# 服务端 1.1.0），却共用同一个 git 标签空间。不加 --match 时，客户端发版打的
-# v0.0.1-dev 会被读到、去掉前导 v 变成 0.0.1-dev，再与 server/package.json 的 1.1.0
+# 服务端 1.2.1），却共用同一个 git 标签空间。不加 --match 时，客户端发版打的
+# v0.0.1-dev 会被读到、去掉前导 v 变成 0.0.1-dev，再与 server/package.json 的 1.2.1
 # 做严格相等校验 —— 必然失败，服务端镜像从此发不出去。
 function Get-GitTag {
     if (-not (Get-Command git -CommandType Application -ErrorAction SilentlyContinue)) { return '' }

@@ -4,3 +4,6 @@ data/
 *.db-wal
 *.db-shm
 admin-token.txt
+
+# 部署配置：含真实域名、对象存储密钥，只提交模板 .env.example
+.env

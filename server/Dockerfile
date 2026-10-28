@@ -4,8 +4,10 @@ FROM node:22-alpine
 
 WORKDIR /app
 
-# 只有三个文件，没有 node_modules，镜像极小
+# 精确 COPY，不用通配符：没有 node_modules，镜像极小。
+# storage/ 是存储驱动目录（local / s3），漏了它容器会因为 require 失败直接退出。
 COPY package.json server.js admin.html ./
+COPY storage ./storage
 
 # 数据目录：SQLite 库 + 安装包本体 + 管理令牌，全部挂这里
 RUN mkdir -p /app/data
