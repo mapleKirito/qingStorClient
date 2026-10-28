@@ -1,6 +1,6 @@
 import {
   fmtBytes, fmtTime, esc, toast, confirmDialog, promptDialog, configDialog, showContextMenu,
-  updateAvailableDialog, updateProgressDialog,
+  updateAvailableDialog,
 } from './util.js';
 import { createTree } from './tree.js';
 import { categoryOf, fileIconHtml } from './fileicon.js';
@@ -744,11 +744,6 @@ function bindEvents() {
     checkUpdates();
   });
 
-  // 下载进度（主进程节流推送）
-  window.bridge.update.onProgress((p) => {
-    if (progressDialog) progressDialog.setProgress(p);
-  });
-
   // 启动后主进程静默探测到新版本：弹窗提示（已请求静默的版本除外）
   window.bridge.update.onAvailable((r) => { handleAvailableUpdate(r); });
 
@@ -759,8 +754,6 @@ function bindEvents() {
 }
 
 /* ================= 版本更新 ================= */
-
-let progressDialog = null;
 
 function setVersionText(text) {
   $('statVersion').textContent = text;
@@ -884,60 +877,49 @@ async function handleAvailableUpdate(r) {
 }
 
 /**
- * 发现新版本 → 询问是否下载。
- * 无论是否勾了忽略，手动点版本号走这里都会弹（忽略只作用于启动自动提醒）。
+ * 发现新版本 → 交给弹窗走完「下载 → 唤起安装器」。
+ * 无论是否忽略过，手动点版本号走这里都会弹（忽略只作用于启动自动提醒）。
  */
 async function promptUpdate(latest) {
   if (!latest || !latest.version || state.promptingUpdate) return;
   state.promptingUpdate = true;
 
-  let choice = { action: 'later', mute: false };
+  let downloaded = null;
+  let result;
   try {
-    choice = await updateAvailableDialog({ current: state.version, latest });
+    result = await updateAvailableDialog({
+      current: state.version,
+      latest,
+      actions: {
+        download: async () => {
+          const res = await window.bridge.update.download(latest);
+          if (res && res.ok) downloaded = res;
+          return res;
+        },
+        install: async () => {
+          if (!downloaded) return { ok: false, error: '还没有下载好的安装包' };
+          return window.bridge.update.install(downloaded.filePath);
+        },
+        reveal: () => window.bridge.update.reveal(downloaded && downloaded.filePath),
+        cancel: () => window.bridge.update.cancel(),
+        skip: async () => {
+          try {
+            state.mutedVersion = await window.bridge.update.muteVersion(latest.version);
+            toast(`已跳过 v${latest.version}，出现更新的版本时还会提示`, '');
+          } catch { /* 落盘失败只影响下次是否再弹 */ }
+        },
+      },
+    });
   } finally {
     state.promptingUpdate = false;
   }
 
-  if (choice.mute) {
-    try {
-      state.mutedVersion = await window.bridge.update.muteVersion(latest.version);
-      toast(`已不再提醒 v${latest.version}，点右下角版本号仍可查看`, '');
-    } catch { /* 落盘失败只影响下次是否再弹 */ }
+  // 安装包已经落到本地，状态栏不必再挂着「可更新」
+  if (downloaded) {
+    state.availableVersion = '';
+    renderVersionLabel();
   }
-  if (choice.action !== 'download') return;
-
-  progressDialog = updateProgressDialog({
-    version: latest.version,
-    onCancel: () => window.bridge.update.cancel(),
-  });
-
-  let res;
-  try {
-    res = await window.bridge.update.download(latest);
-  } catch (e) {
-    res = { ok: false, error: e.message || String(e) };
-  } finally {
-    if (progressDialog) { progressDialog.close(); progressDialog = null; }
-  }
-
-  if (!res || !res.ok) {
-    toast('下载更新失败：' + ((res && res.error) || '未知错误'), 'err');
-    return;
-  }
-  state.availableVersion = '';
-  renderVersionLabel();
-
-  const install = await confirmDialog({
-    title: '下载完成',
-    text: `v${esc(latest.version)} 安装包已下载到：<br/><code style="font-size:11.5px">${esc(res.filePath)}</code><br/><br/>现在运行安装程序吗？（安装前建议先退出本程序）`,
-    okText: '立即安装',
-  });
-  if (!install) {
-    toast('已保存安装包，可稍后手动运行', '');
-    return;
-  }
-  const r = await window.bridge.update.install(res.filePath);
-  if (!r || !r.ok) toast('启动安装程序失败：' + ((r && r.error) || '未知错误'), 'err');
+  return result;
 }
 
 /* ================= 设置与启动 ================= */
@@ -1049,6 +1031,25 @@ if (window.bridge.env && window.bridge.env.smoke) {
     setSearch(v) {
       state.search = String(v || '');
       syncSearchInput();
+    },
+    /**
+     * 冒烟用：把「发现新版本」弹窗按真实参数打开，用来核对文案与按钮流转。
+     * 不传真实 actions —— 冒烟只验界面，不真的下载。
+     */
+    openUpdateMock() {
+      updateAvailableDialog({
+        current: '0.0.1-dev.1',
+        latest: {
+          version: '1.0.0-dev',
+          channel: 'dev',
+          platform: 'win',
+          arch: 'x64',
+          size: 87765432,
+          publishedAt: new Date('2026-10-28T09:26:00Z').toISOString(),
+          notes: '新增左侧目录树、文件类型图标、大目录分页与前缀搜索。',
+        },
+        actions: { download: () => ({ ok: false, error: 'smoke' }) },
+      });
     },
   };
 }

@@ -138,6 +138,20 @@ const SMOKE_SCRIPT = `(async () => {
   const modalRoot = document.getElementById('modalRoot');
   if (modalRoot) modalRoot.innerHTML = '';
 
+  // 更新弹窗：文案与按钮要对齐参考项目（单弹窗内嵌进度、下载完直接唤起安装器）
+  sm.openUpdateMock();
+  const modal = modalRoot.querySelector('.modal');
+  add('更新弹窗已打开', !!modal);
+  const titleEl = modal && modal.querySelector('.modal-title');
+  add('弹窗标题正确', !!titleEl && titleEl.textContent.trim() === '发现新版本', titleEl ? titleEl.textContent.trim() : '');
+  const mainBtn = modal && modal.querySelector('#updGo');
+  add('主按钮为「下载并安装」', !!mainBtn && mainBtn.textContent.trim() === '下载并安装', mainBtn ? mainBtn.textContent.trim() : '');
+  add('有「跳过此版本」', !!modal && !!modal.querySelector('#updSkip'));
+  add('进度区默认隐藏', !!modal && modal.querySelector('#updProgress').hidden);
+  const hintEl = modal && modal.querySelector('.hint');
+  const hintText = hintEl ? hintEl.textContent : '';
+  add('提示不再提「安全提示」', hintText.indexOf('代码签名') < 0 && hintText.indexOf('安全提示') < 0, hintText.slice(0, 28) + '…');
+
   return out;
 })()`;
 
