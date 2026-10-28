@@ -1,6 +1,6 @@
 {
   "name": "qingstor-client",
-  "version": "0.0.1-dev.1",
+  "version": "1.0.0-dev",
   "description": "青云对象存储桌面客户端：网盘式管理文件与目录，支持多选/文件夹上传下载",
   "author": "mapleKirito",
   "main": "electron/main.js",
