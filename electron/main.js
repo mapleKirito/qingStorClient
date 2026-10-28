@@ -25,6 +25,7 @@ if (SMOKE) {
 
 const configStore = new ConfigStore(app.getPath('userData'));
 const channelStore = new update.ChannelStore(app.getPath('userData'));
+const muteStore = new update.MuteStore(app.getPath('userData'));
 const uiStateStore = new UiStateStore(app.getPath('userData'));
 const transfers = new TransferManager();
 let mainWindow = null;
@@ -64,6 +65,130 @@ function registerAppProtocol() {
   });
 }
 
+/* ---------------- 冒烟测试 ---------------- */
+
+// 渲染进程错误（console error 级、加载失败、渲染进程崩溃）都算失败
+const smokeErrors = [];
+
+/**
+ * 在渲染进程里跑的断言集。
+ *
+ * 不依赖真实 bucket：渲染层在 QINGSTOR_SMOKE=1 时暴露 window.__smoke，
+ * 这里直接注入假目录，验证图标映射、选择态增量更新、分页条、排序、空态。
+ * 这样「大目录优化」这类重构也能在没有网络和凭据的情况下冒烟。
+ */
+const SMOKE_SCRIPT = `(async () => {
+  const out = [];
+  const add = (name, ok, detail) => out.push({ name: name, ok: !!ok, detail: detail === undefined ? '' : String(detail) });
+  const $ = (id) => document.getElementById(id);
+  const sm = window.__smoke;
+  add('渲染层模块加载', !!sm && !!window.bridge);
+  if (!sm) return out;
+
+  add('基础容器齐备', [$('treeBody'), $('breadcrumb'), $('searchInput'), $('pager'), $('tableBody'), $('checkAll')].every(Boolean));
+
+  const names = ['照片.PNG', '片子.mp4', '歌.mp3', '报告.docx', '预算.xlsx', '汇报.pptx', '说明.pdf', '包.zip', 'main.js', 'readme.md', 'setup.exe', '字体.ttf', '神秘文件.xyz'];
+  const expect = ['dir', 'image', 'video', 'audio', 'doc', 'sheet', 'slide', 'pdf', 'archive', 'code', 'text', 'exe', 'font', 'other'];
+  const entries = [{ name: '资料', key: '资料', isDir: true }].concat(names.map((n, i) => ({
+    name: n, key: n, size: (i + 1) * 1024, mtime: '2026-10-28T08:00:00.000Z', isDir: false,
+  })));
+  sm.inject(entries);
+
+  const rows = document.querySelectorAll('#tableBody .row');
+  add('行渲染数量', rows.length === entries.length, rows.length + '/' + entries.length);
+
+  const cats = Array.prototype.map.call(document.querySelectorAll('#tableBody .file-ic'), (el) => el.className.replace('file-ic ', ''));
+  add('图标类别映射', JSON.stringify(cats) === JSON.stringify(expect), cats.join(','));
+
+  const uses = Array.prototype.map.call(document.querySelectorAll('#tableBody .file-ic use'), (u) => (u.getAttribute('href') || '').replace('#', ''));
+  add('SVG 图标引用齐全', uses.length === entries.length && uses.every((id) => !!document.getElementById(id)), uses.length + ' 个引用');
+
+  const before = document.querySelectorAll('#tableBody .row')[1];
+  sm.selectOnly(1);
+  const after = document.querySelectorAll('#tableBody .row')[1];
+  add('选择态增量更新（节点复用）', before === after && after.classList.contains('selected'), before === after ? '复用既有节点' : '节点被整表重建');
+
+  const all = $('checkAll');
+  all.checked = true;
+  all.dispatchEvent(new Event('change'));
+  add('全选', document.querySelectorAll('#tableBody .row.selected').length === entries.length, document.querySelectorAll('#tableBody .row.selected').length + ' 行选中');
+
+  document.querySelector('.table-head .cell-name').click();
+  add('列头排序切换', sm.state.sort.dir === 'desc', 'sort=' + sm.state.sort.by + ':' + sm.state.sort.dir);
+
+  sm.setPage(2, true);
+  add('分页条出现', !$('pager').classList.contains('hidden'));
+  add('页码显示第 3 页', $('pageLabel').textContent.indexOf('3') >= 0, $('pageLabel').textContent);
+  add('下一页可用', $('btnNextPage').disabled === false);
+  add('上一页可用', $('btnPrevPage').disabled === false);
+
+  sm.setPage(0, false);
+  add('单页时分页条隐藏', $('pager').classList.contains('hidden'));
+
+  sm.setSearch('报告');
+  add('搜索词回填输入框', $('searchInput').value === '报告', $('searchInput').value);
+  sm.setSearch('');
+
+  sm.inject([]);
+  add('空目录占位', !!document.querySelector('#tableBody .empty-state'));
+
+  // 收尾恢复一份有内容的列表，方便 --shot 截图核对图标与分页条
+  sm.inject(entries);
+  sm.setPage(2, true);
+  const modalRoot = document.getElementById('modalRoot');
+  if (modalRoot) modalRoot.innerHTML = '';
+
+  return out;
+})()`;
+
+async function runSmokeChecks() {
+  let checks = [];
+  try {
+    checks = await mainWindow.webContents.executeJavaScript(SMOKE_SCRIPT, true);
+  } catch (e) {
+    smokeErrors.push('执行冒烟脚本失败：' + (e.message || e));
+  }
+  if (!Array.isArray(checks)) checks = [];
+
+  // 可选：把断言后的界面截下来，人工核对图标 / 分页条的视觉效果
+  if (process.env.QINGSTOR_SMOKE_SHOT === '1') {
+    try {
+      // 等一帧：清掉弹窗后立刻截图会拿到旧画面
+      await new Promise((r) => setTimeout(r, 500));
+      const img = await mainWindow.webContents.capturePage();
+      const shot = path.join(require('node:os').tmpdir(), 'qingstor-smoke.png');
+      fs.writeFileSync(shot, img.toPNG());
+      console.log('SMOKE_SHOT: ' + shot);
+    } catch (e) {
+      console.warn('截图失败：' + (e.message || e));
+    }
+  }
+
+  for (const c of checks) {
+    console.log(`${c.ok ? '  ok  ' : ' FAIL '} ${c.name}${c.detail ? ' — ' + c.detail : ''}`);
+  }
+  const failed = checks.filter((c) => !c.ok).length;
+  if (failed || smokeErrors.length) {
+    if (smokeErrors.length) console.error('SMOKE_ERRORS:\n' + smokeErrors.join('\n'));
+    console.error(`SMOKE_FAILED: ${failed} 项断言失败 / ${smokeErrors.length} 条运行时错误`);
+    app.exit(1);
+  } else {
+    console.log(`SMOKE_OK: ${checks.length} 项断言全部通过`);
+    app.exit(0);
+  }
+}
+
+/** 挂冒烟采集：错误收集 + 页面加载完成后跑断言 */
+function attachSmoke(win) {
+  const wc = win.webContents;
+  wc.on('console-message', (_e, level, message) => {
+    if (level >= 2) smokeErrors.push(message);
+  });
+  wc.on('render-process-gone', () => smokeErrors.push('renderer gone'));
+  wc.on('did-fail-load', (_e, code, desc) => smokeErrors.push(`load failed: ${code} ${desc}`));
+  wc.once('did-finish-load', () => setTimeout(runSmokeChecks, 1500));
+}
+
 /* ---------------- 窗口 ---------------- */
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -85,26 +210,10 @@ function createWindow() {
     },
   });
 
+  if (SMOKE) attachSmoke(mainWindow);
+
   mainWindow.once('ready-to-show', () => {
     mainWindow.show();
-    if (SMOKE) {
-      // 冒烟：收集渲染进程错误，2 秒后按有无错误决定退出码
-      const errors = [];
-      mainWindow.webContents.on('console-message', (_e, level, message) => {
-        if (level >= 2) errors.push(message);
-      });
-      mainWindow.webContents.on('render-process-gone', () => errors.push('renderer gone'));
-      mainWindow.webContents.on('did-fail-load', (_e, code, desc) => errors.push(`load failed: ${code} ${desc}`));
-      setTimeout(() => {
-        if (errors.length) {
-          console.error('SMOKE_ERRORS:\n' + errors.join('\n'));
-          app.exit(1);
-        } else {
-          console.log('SMOKE_OK');
-          app.exit(0);
-        }
-      }, 2500);
-    }
   });
   mainWindow.on('closed', () => { mainWindow = null; });
 
@@ -264,10 +373,11 @@ function registerIpc() {
   // 连接测试（使用传入配置，不落盘）
   ipcMain.handle('s3:test', async (_e, cfg) => s3.testConnection(cfg));
 
-  ipcMain.handle('s3:list', async (_e, dir) => {
+  // 分页列举：带游标 / 页大小 / 前缀搜索词，单次请求，不再一路翻到底
+  ipcMain.handle('s3:list', async (_e, dir, opts) => {
     const cfg = requireConfig();
     const client = s3.createClient(cfg);
-    return s3.listDir(client, cfg, String(dir || ''));
+    return s3.listDir(client, cfg, String(dir || ''), opts || {});
   });
 
   // 目录树只拉子目录，不拉文件
@@ -386,6 +496,11 @@ function registerIpc() {
 
   ipcMain.handle('update:channel', () => ({ channel: channelStore.get() }));
 
+  // 「不再提醒此版本」：只记版本号，换版本自动重新提醒
+  ipcMain.handle('update:muted', () => muteStore.get());
+  ipcMain.handle('update:mute', (_e, version) => muteStore.set(version));
+  ipcMain.handle('update:unmute', () => muteStore.clear());
+
   ipcMain.handle('update:setChannel', (_e, channel) => {
     try {
       return { ok: true, channel: setUpdateChannel(channel) };
@@ -443,6 +558,7 @@ if (!gotLock) {
   app.whenReady().then(() => {
     configStore.load();
     channelStore.load();
+    muteStore.load();
     uiStateStore.load();
     global.__qingCfg = configStore.isEmpty ? null : configStore.data;
     registerAppProtocol();

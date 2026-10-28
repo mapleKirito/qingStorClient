@@ -272,7 +272,11 @@ export function closeContextMenu() {
 
 /* ---------------- 更新相关弹窗 ---------------- */
 
-/** 发现新版本，resolve('download' | 'later') */
+/**
+ * 发现新版本弹窗。
+ * resolve({ action: 'download' | 'later', mute: boolean })
+ * mute 只表示「用户勾了不再提醒此版本」，落盘由调用方决定（渲染层通过 IPC 写）。
+ */
 export function updateAvailableDialog({ current, latest }) {
   return new Promise((resolve) => {
     const notes = latest.notes
@@ -291,7 +295,8 @@ export function updateAvailableDialog({ current, latest }) {
           </div>
           <div class="upd-meta">${esc(latest.channel)} 渠道 · ${esc(latest.platform)} · ${esc(latest.arch)} · ${esc(fmtBytes(latest.size))}${latest.publishedAt ? ' · ' + esc(fmtTime(new Date(latest.publishedAt).toISOString())) : ''}</div>
           ${notes}
-          <div class="hint" style="margin-top:12px">下载完成后需手动运行安装包完成升级（程序未做代码签名，系统会弹一次安全提示）。</div>
+          <label class="checkbox-row" style="margin-top:12px"><input type="checkbox" id="updMute" /> 不再提醒 v${esc(latest.version)}（状态栏仍会标记可更新）</label>
+          <div class="hint">下载完成后需手动运行安装包完成升级（程序未做代码签名，系统会弹一次安全提示）。</div>
         </div>
         <div class="modal-foot">
           <button class="btn" data-close>以后再说</button>
@@ -299,9 +304,16 @@ export function updateAvailableDialog({ current, latest }) {
         </div>
       </div>`);
     let done = false;
-    mask.querySelector('#updGo').addEventListener('click', () => { done = true; resolve('download'); close(); });
-    mask.addEventListener('mousedown', (e) => { if (e.target === mask && !done) resolve('later'); });
-    mask.querySelectorAll('[data-close]').forEach((b) => b.addEventListener('click', () => { if (!done) resolve('later'); }));
+    const finish = (action) => {
+      if (done) return;
+      done = true;
+      const box = mask.querySelector('#updMute');
+      resolve({ action, mute: !!(box && box.checked) });
+      close();
+    };
+    mask.querySelector('#updGo').addEventListener('click', () => finish('download'));
+    mask.addEventListener('mousedown', (e) => { if (e.target === mask) finish('later'); });
+    mask.querySelectorAll('[data-close]').forEach((b) => b.addEventListener('click', () => finish('later')));
   });
 }
 

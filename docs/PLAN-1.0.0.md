@@ -3,7 +3,7 @@
 > 版本线 `ver/1.0`，目标版本 `1.0.0-dev`。本文件是 1.0 的功能清单与实施记录，随开发进展更新。
 > 版本位判定、分支与标签规则见 [VERSIONING.md](VERSIONING.md)；本文只记「做什么、怎么做」。
 
-当前状态：**计划阶段**，四条需求已确认，等待排期开工。
+当前状态：**1.0.0-dev 开发中**，五条需求全部落地，冒烟测试（15 项断言）通过。
 
 ---
 
@@ -48,6 +48,8 @@
 **改动文件**：`renderer/js/main.js`（onAvailable 回调、statVersion 点击、忽略状态判断）、`renderer/js/util.js`（`updateAvailableDialog` 加勾选框，返回 `{ choice, mute }`）、`electron/main.js` + `preload.js`（读写 `update-muted.json`）
 
 **验收**：装旧版启动 → 6 秒后自动弹更新框；不勾忽略 → 下次启动仍弹；勾了忽略 → 下次只留状态栏标记；点版本号 → 忽略状态下也能重新弹出；无新版时全程无感知；未配置连接时不弹。
+
+**进度**：✅ 已完成。`electron/update.js` 新增 `MuteStore`（`userData/update-muted.json`，只记版本号）；`updateAvailableDialog` 改为返回 `{ action, mute }` 并加「不再提醒此版本 vX」勾选框；渲染层 `handleAvailableUpdate()` 负责三处让行（未配置连接 → 暂存 `state.pendingUpdate`，配置完成后 `flushPendingUpdate()` 补弹；已忽略该版本 → 只留状态栏标记 + toast；已有弹窗在处理 → 直接跳过）。手动点版本号走同一条 `promptUpdate()`，不受忽略影响。
 
 ---
 
@@ -99,6 +101,8 @@
 **改动文件**：`renderer/js/fileicon.js`（新）、`renderer/index.html`（symbol 集）、`renderer/css/app.css`、`renderer/js/main.js`（行渲染处改为 `fileIconHtml(name, isDir)`）
 
 **验收**：`.png/.jpg` 显示图片图标、`.zip` 压缩包图标、`.docx` 文档图标；无扩展名文件不报错；深浅色下都清晰；纯字符串拼接、无 DOM 依赖，分页渲染时直接复用。
+
+**进度**：✅ 已完成。`renderer/js/fileicon.js` 提供 `categoryOf()` / `fileIconHtml()`，13 个类别 + `dir`；图标是 `index.html` `#iconDefs` 里的 `<symbol>`，行内只用 `<use href="#ico-xxx">`，颜色由 `.file-ic.<category>` 的 currentColor 控制。目录树图标一并换掉，不再有 emoji。
 
 ---
 
@@ -164,6 +168,15 @@
 **改动文件**：`electron/s3.js`（`listPage` / `searchPage`，`listAll` 保留给删除用）、`electron/main.js` + `preload.js`（IPC 透传）、`renderer/js/main.js`（分页状态 + 渲染重构，改动最大）、`renderer/index.html`（分页条 + 搜索框）、`renderer/css/app.css`
 
 **验收**：10 万对象的目录首屏 1 秒内出第一页；翻页 < 800ms；单页 200 行选中 / 全选 / Shift 连选无卡顿；前缀搜索能搜到尚未加载页的对象；上一页秒回；内存长期稳定在分页缓存上限内。
+
+**进度**：✅ 已完成。落地要点：
+
+- `s3.listDir` 改为**单次请求一页**（`MaxKeys` 200 + `ContinuationToken`），返回 `{ dirs, files, truncated, nextToken }`；`listAll` 保持不变，仍给删除用
+- 渲染层 `state.page = { index, tokens[], nextToken, hasMore }` + `pageCache`（LRU 20 页），上一页命中缓存秒回
+- 搜索框 300ms 防抖，`Prefix = dir + 关键词`，服务端前缀匹配、能命中未加载页；清空即回浏览模式
+- 选择 / 全选 / Shift 连选改为 `repaintKeys()` 只切目标行的 class 与勾选框，冒烟里以「同一行 DOM 节点是否被复用」作为断言
+- 列头排序只作用于当前页（D5），目录恒在前，列头带 ▲/▼ 与「仅当前页」提示
+- 顺带修掉一个既有缺陷：`s3.listDir` 返回的目录项字段是 `dir: true`，渲染层却读 `isDir`，导致**目录显示成文件、双击进不去**。现在在 `loadPage` 统一成 `isDir`
 
 ---
 
@@ -249,3 +262,4 @@
 | 2026-10-28 | 决策定稿：D1 可折叠+拖宽+记忆；D2 改为游标分页（放弃虚拟滚动）；D3 每次启动弹+可忽略；D4 服务端前缀搜索 + 本地页缓存评估结论 |
 | 2026-10-28 | 追加需求 5：移除 `.`/`..` 占位行（功能与工具栏/面包屑完全重复），面包屑从顶栏移到目录区上方；与 ② 合并同批实施 |
 | 2026-10-28 | ② 目录树 + ⑤ 面包屑/占位行 已完成（`94eb066`）。下一步 ③ 文件图标 |
+| 2026-10-28 | ③ 文件图标 + ④ 游标分页/前缀搜索/增量选择 + ① 启动更新弹窗 全部完成。冒烟脚本升级为渲染层断言（15 项），`npm run smoke` 全绿；`QINGSTOR_SMOKE_SHOT=1` 可留存一张界面截图用于人工核对 |

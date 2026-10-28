@@ -10,6 +10,7 @@
  */
 
 import { esc } from './util.js';
+import { fileIconHtml } from './fileicon.js';
 
 const LOADING = Symbol('loading');
 const MIN_W = 160;
@@ -78,7 +79,7 @@ export function createTree({ panel, body, splitter, expandBtn, collapseBtn, refr
     let html = `<div class="tree-node${key === currentKey ? ' current' : ''}${loading ? ' loading' : ''}"`
       + ` data-key="${esc(key)}" style="padding-left:${pad}px">`
       + `<span class="tn-caret${isOpen ? ' open' : ''}" data-toggle="1" title="展开 / 收起">▸</span>`
-      + `<span class="tn-icon">📁</span>`
+      + `<span class="tn-icon">${fileIconHtml('dir')}</span>`
       + `<span class="tn-name" title="${esc(name)}">${esc(name)}</span>`
       + '</div>';
 
