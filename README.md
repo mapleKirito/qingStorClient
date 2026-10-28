@@ -2,7 +2,7 @@
 
 青云对象存储（QingStor / S3 兼容）桌面客户端。网盘式浏览桶内文件与目录，支持多选、文件夹上传/下载、拖拽上传、传输队列与断点取消。
 
-> 当前版本 **0.0.1-dev**（处于 v0.0.x 开发期，只出开发包、不打正式标签）：已从 Python + PyQt 实现整体迁移到 Electron，架构与打包方式对齐 `myApiTools`。
+> 当前版本 **1.0.0-dev**（在 `ver/1.0` 版本线上开发，只出开发包、不打正式标签）。`0.0.1-dev` 初始开发期已结束，从 Python + PyQt 迁到 Electron 的架构改造已完成。
 
 ## 功能特性
 
@@ -67,8 +67,8 @@ npm run dist:win
 
 产物在 `dist/`：
 
-- `QingStorClient-Setup-0.0.1-dev-x64.exe` —— NSIS 安装版（可选安装目录、创建快捷方式）
-- `QingStorClient-0.0.1-dev-x64.exe` —— 免安装便携版
+- `QingStorClient-Setup-1.0.0-dev-x64.exe` —— NSIS 安装版（可选安装目录、创建快捷方式）
+- `QingStorClient-1.0.0-dev-x64.exe` —— 免安装便携版
 
 为什么不用 `npx electron-builder --win` 直接打：`tools/dist-win.ps1` 解决了两个本地必然会踩的坑。
 
@@ -101,22 +101,23 @@ npm run version:bump -- z --dev    # 从正式版进开发版  1.2.3 -> 1.2.4-de
 
 **`dev` 动作只递增已有开发号**，对正式版会报错——`1.2.3` 加 `-dev` 得到的 `1.2.3-dev` 比正式版还低，客户端判定「已是最新」，推上去没人收得到。要从正式版进下一轮开发，用 `z --dev`（或 `y --dev` / `x --dev`）。完整规则见 [`docs/VERSIONING.md`](docs/VERSIONING.md#15-改版本号的操作规程)。
 
-### 版本阶段与分支约定（v0.0.x 开发期）
+### 版本阶段与分支约定（ver/1.0 开发期）
 
-当前版本是 `0.0.1-dev`，属于 **v0.0.x 开发期**。这个阶段的规则和正式版不一样：
+当前版本是 `1.0.0-dev`，在 `ver/1.0` 版本线上开发。规则与已结束的 `v0.0.x` 初始开发期不同：
 
-| | v0.0.x 开发期（现在） | 正式版（以后） |
+| | ver/1.0 开发期（现在） | 正式发版后 |
 | --- | --- | --- |
-| 版本号 | `0.0.x-dev`，当前 `0.0.1-dev`（z 当开发迭代号用） | `x.y.z`，如 `1.0.0` |
-| 分支 | **无版本分支**：直接提交 `main`，本机手动构建 | `ver/<x.y>`，如 `ver/1.0`（不带 patch） |
-| 打标签 | **不打**，没有正式发布计划 | 打 `v*` 标签 → 自动 Release |
+| 版本号 | `1.0.0-dev`，需区分构建轮次时加序号 `1.0.0-dev.1` | `x.y.z`，如 `1.0.0` |
+| 分支 | **`ver/1.0`**（分支名只带 x.y，不带 patch） | 同一条 `ver/1.0`，z 补丁也在这条线上 |
+| 打标签 | **暂不打**：功能未冻结，打标签即触发 Release | 冻结后打 `v1.0.0` → 自动 Release |
 | 下发渠道 | 服务端 `channel=dev` | 服务端 `channel=stable` |
+| 产物来源 | 本机 `npm run dist:win`，或推送 `ver/1.0` 后取 Actions artifacts | GitHub Release |
 
 几条配套约定：
 
-- **同版本反复重发是允许的**。服务端对「渠道 + 版本 + 平台 + 架构」采用覆盖语义，所以开发期改完直接重发 `0.0.1-dev` 即可，不必为了重发去 bump 版本号；要区分「第几次构建」再加序号（`0.0.1-dev.1`、`-dev.2`……，序号无上限）。
+- **同版本反复重发是允许的**。服务端对「渠道 + 版本 + 平台 + 架构」采用覆盖语义，所以开发期改完直接重发 `1.0.0-dev` 即可，不必为了重发去 bump 版本号；要区分「第几次构建」再加序号（`1.0.0-dev.1`、`-dev.2`……，序号无上限）。
 - **开发包进服务端要打 `channel=dev`**，客户端把右下角渠道徽标切到「开发版」才能收到（默认是 `stable`）。
-- **别随手打 `v*` 标签**。CI 的守卫要求标签名去掉 `v` 后与 `version` 严格相等，`0.0.1-dev` 要打就得打成 `v0.0.1-dev`；而且一旦打标签就会触发 Release，与「v0.0.x 不正式发布」冲突。
+- **`main` 暂时落后于 `ver/1.0`**。`main` 上还是 `0.0.1-dev.1` 的初始开发版内容，等 `1.0.0` 正式发布时才合并回去——这是「`main` 永远等于最新正式版」的唯一当前例外。
 - 客户端 `parseVersion` / 服务端 `parseVersion` 都认带 `-pre` 后缀的版本，预发布段按 SemVer 2.0 逐段比较（数字段按数值比，`dev.9 < dev.10`），预发布版恒小于同号正式版。
 
 ### 三档触发规则
@@ -131,7 +132,7 @@ npm run version:bump -- z --dev    # 从正式版进开发版  1.2.3 -> 1.2.4-de
 
 ### 正式发版
 
-> v0.0.x 开发期**不执行这一节**（不打标签）。以下是将来有正式发布计划时的流程。
+> 当前 `1.0.0-dev` 处于开发期，**暂不执行这一节**（功能未冻结、不打标签）。以下是定版发布 `1.0.0` 时的流程。
 
 ```bash
 # 0. 前置：功能已冻结，开发包在目标平台验证通过
@@ -182,7 +183,7 @@ git push -u origin ver/1.1
 
 **同一时刻只维护一条版本线。** `ver/1.1` 一旦创建，`ver/1.0` 就终止维护——不删、历史保留，但不再接收提交、不出补丁、不打标签。缺陷修复永远落在当前最新的 `ver/x.y` 上；老用户报的旧版本问题，先在新版本确认，仍存在就按 `z+1` 修在新版本里。详细理由与禁止事项见 [`docs/VERSIONING.md` 第 5.5 节](docs/VERSIONING.md)。
 
-**当前 `0.0.1-dev` 是初始开发版，不走上面这条路径。** 它直接住在 `main` 上：没有版本分支、不推 CI、不打标签，产物在**本机手动构建**：
+**当前 `1.0.0-dev` 就在版本线 `ver/1.0` 上**，功能开发期不必动版本号：
 
 ```bash
 npm run dist:win      # Windows：NSIS 安装版 + 便携版
@@ -190,7 +191,7 @@ npm run dist:mac      # macOS
 npm run dist:linux    # Linux
 ```
 
-产物落在 `dist/`，文件名带版本号（`QingStorClient-Setup-0.0.1-dev-x64.exe`、`QingStorClient-0.0.1-dev-x64.exe`），可直接分发给测试，或上传更新服务 `dev` 渠道。等出现第一个正式版本计划时，才从 `main` 拉 `ver/x.y` 按上面的流程走，详见 [`docs/VERSIONING.md` 1.3.1](docs/VERSIONING.md)。
+产物落在 `dist/`，文件名带版本号（`QingStorClient-Setup-1.0.0-dev-x64.exe`、`QingStorClient-1.0.0-dev-x64.exe`），可直接分发给测试，或上传更新服务 `dev` 渠道。推送 `ver/1.0` 也会触发三平台开发包构建（Actions artifacts，不发 Release）。功能冻结、验证通过后再按上一节定版 `1.0.0`。
 
 ## 版本更新服务（`server/`）
 
@@ -227,15 +228,15 @@ ssh -N -L 8790:127.0.0.1:8790 user@your-server
 接口形态（客户端发出的请求就是这一条）：
 
 ```bash
-curl "https://qingstorclient.myzhouye.com/api/releases/latest?platform=win&arch=x64&channel=dev&current=0.0.1-dev"
-# → { "updateAvailable": true, "latest": { "version": "0.0.2-dev", "sha256": "...", "downloadUrl": "..." } }
+curl "https://qingstorclient.myzhouye.com/api/releases/latest?platform=win&arch=x64&channel=dev&current=0.0.1-dev.1"
+# → { "updateAvailable": true, "latest": { "version": "1.0.0-dev", "sha256": "...", "downloadUrl": "..." } }
 ```
 
 客户端的更新行为：
 
 | 时机 | 行为 |
 | --- | --- |
-| 启动后约 6 秒 | 静默探一次，**只有发现新版**才在状态栏标 `v0.0.1-dev → v0.0.2-dev 可更新` 并轻提示；网络不通则一声不响 |
+| 启动后约 6 秒 | 静默探一次，**只有发现新版**才在状态栏标 `v0.0.1-dev.1 → v1.0.0-dev 可更新` 并轻提示；网络不通则一声不响 |
 | 点右下角版本号 / 菜单「帮助 → 检查更新…」 | 主动检查，失败会明确报错 |
 | 发现新版 | 弹窗展示版本号、大小、更新时间与发版说明，由用户决定是否下载 |
 | 下载 | 落到 `userData/updates/<渠道>/`，先写 `.part`，边下边算 sha256，与接口返回的 `sha256` 比对通过才改名；可取消、进度实时 |
