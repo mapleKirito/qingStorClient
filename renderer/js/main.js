@@ -1,9 +1,17 @@
-import { fmtBytes, fmtTime, esc, toast, confirmDialog, promptDialog, configDialog, showContextMenu } from './util.js';
+import {
+  fmtBytes, fmtTime, esc, toast, confirmDialog, promptDialog, configDialog, showContextMenu,
+  updateAvailableDialog, updateProgressDialog,
+} from './util.js';
 
 const $ = (id) => document.getElementById(id);
 
 const state = {
   version: '',
+  electron: '',
+  updateBase: '',
+  channel: 'stable',   // 当前更新渠道：stable / dev
+  availableVersion: '',
+  checkingUpdate: false,
   configured: false,
   currentDir: '', // 相对前缀的目录 key
   entries: [],    // [{key, name, isDir, size, mtime}]
@@ -490,12 +498,179 @@ function bindEvents() {
     else if (action === 'upload-folder') uploadFolder();
     else if (action === 'new-folder') newFolder();
     else if (action === 'settings') openSettings();
+    else if (action === 'check-update') checkUpdates();
+  });
+
+  // 版本号可点击：检查更新 / 下载已发现的新版本
+  $('statVersion').addEventListener('click', () => checkUpdates());
+  // 渠道徽标可点击：切换 stable / dev
+  $('statChannel').addEventListener('click', openChannelMenu);
+
+  // 菜单里切换渠道后主进程会广播，这里同步界面并重查
+  window.bridge.update.onChannel((ch) => {
+    if (!ch || ch === state.channel || ch === switchingChannel) return;
+    applyChannel(ch);
+    toast(`已切换到${CHANNEL_LABELS[ch] || ch}渠道，正在检查更新…`, 'ok');
+    checkUpdates();
+  });
+
+  // 下载进度（主进程节流推送）
+  window.bridge.update.onProgress((p) => {
+    if (progressDialog) progressDialog.setProgress(p);
+  });
+
+  // 启动后主进程静默探测到新版本：只留提示，不打断当前操作
+  window.bridge.update.onAvailable((r) => {
+    if (!r || !r.latest) return;
+    state.availableVersion = r.latest.version;
+    renderVersionLabel();
+    toast(`发现新版本 v${r.latest.version}，点击右下角版本号更新`, 'ok');
   });
 
   window.addEventListener('keydown', (e) => {
     if (e.key === 'F5') { e.preventDefault(); loadDir(state.currentDir); }
     if (e.key === 'Escape') { document.getElementById('ctxRoot').innerHTML = ''; }
   });
+}
+
+/* ================= 版本更新 ================= */
+
+let progressDialog = null;
+
+function setVersionText(text) {
+  $('statVersion').textContent = text;
+}
+
+const CHANNEL_LABELS = { stable: '正式版', dev: '开发版' };
+let switchingChannel = null;
+
+function renderChannelBadge() {
+  const el = $('statChannel');
+  el.textContent = state.channel === 'dev' ? 'dev' : 'stable';
+  el.classList.toggle('dev', state.channel === 'dev');
+  el.title = `更新渠道：${CHANNEL_LABELS[state.channel] || state.channel}（点击切换）`;
+}
+
+function openChannelMenu() {
+  const r = $('statChannel').getBoundingClientRect();
+  const items = ['stable', 'dev'].map((ch) => ({
+    label: `${CHANNEL_LABELS[ch]}（${ch}）`,
+    icon: state.channel === ch ? '✓' : '·',
+    click: () => switchChannel(ch),
+  }));
+  // 状态栏在底部，菜单要往上弹
+  showContextMenu(r.left, Math.max(6, r.top - 88), items);
+}
+
+/** 切换渠道：主进程负责落盘与重建菜单，这里清掉旧渠道的「可更新」状态并立即按新渠道重查 */
+async function switchChannel(ch) {
+  if (!ch || ch === state.channel) return;
+  switchingChannel = ch;
+  try {
+    const r = await window.bridge.update.setChannel(ch);
+    if (!r || !r.ok) {
+      toast('切换渠道失败：' + ((r && r.error) || '未知错误'), 'err');
+      return;
+    }
+    applyChannel(r.channel);
+    toast(`已切换到${CHANNEL_LABELS[r.channel] || r.channel}渠道，正在检查更新…`, 'ok');
+    await checkUpdates();
+  } finally {
+    switchingChannel = null;
+  }
+}
+
+function applyChannel(ch) {
+  if (!ch) return;
+  state.channel = ch;
+  state.availableVersion = '';
+  renderChannelBadge();
+  renderVersionLabel();
+}
+
+function renderVersionLabel() {
+  const el = $('statVersion');
+  if (state.availableVersion) {
+    el.textContent = `v${state.version} → v${state.availableVersion} 可更新`;
+    el.title = '点击下载更新';
+    el.classList.add('has-update');
+  } else {
+    el.textContent = `v${state.version}${state.electron ? ` · Electron ${state.electron}` : ''}`;
+    el.title = '点击检查更新';
+    el.classList.remove('has-update');
+  }
+}
+
+/**
+ * 检查更新。
+ * silent=true 用于启动后的自动探测：只在状态栏留痕，不弹窗、不报错。
+ */
+async function checkUpdates({ silent = false } = {}) {
+  if (state.checkingUpdate) return;
+  state.checkingUpdate = true;
+  if (!silent) setVersionText('检查更新中…');
+
+  let r;
+  try {
+    r = await window.bridge.update.check();
+  } catch (e) {
+    r = { ok: false, error: e.message || String(e) };
+  } finally {
+    state.checkingUpdate = false;
+  }
+
+  if (!r || !r.ok) {
+    renderVersionLabel();
+    if (!silent) toast('检查更新失败：' + ((r && r.error) || '未知错误'), 'err');
+    return;
+  }
+
+  state.availableVersion = r.updateAvailable && r.latest ? r.latest.version : '';
+  renderVersionLabel();
+
+  if (!state.availableVersion) {
+    if (!silent) toast(`已是最新版本 v${state.version}`, 'ok');
+    return;
+  }
+  await promptUpdate(r.latest);
+}
+
+async function promptUpdate(latest) {
+  const choice = await updateAvailableDialog({ current: state.version, latest });
+  if (choice !== 'download') return;
+
+  progressDialog = updateProgressDialog({
+    version: latest.version,
+    onCancel: () => window.bridge.update.cancel(),
+  });
+
+  let res;
+  try {
+    res = await window.bridge.update.download(latest);
+  } catch (e) {
+    res = { ok: false, error: e.message || String(e) };
+  } finally {
+    if (progressDialog) { progressDialog.close(); progressDialog = null; }
+  }
+
+  if (!res || !res.ok) {
+    toast('下载更新失败：' + ((res && res.error) || '未知错误'), 'err');
+    return;
+  }
+  state.availableVersion = '';
+  renderVersionLabel();
+
+  const install = await confirmDialog({
+    title: '下载完成',
+    text: `v${esc(latest.version)} 安装包已下载到：<br/><code style="font-size:11.5px">${esc(res.filePath)}</code><br/><br/>现在运行安装程序吗？（安装前建议先退出本程序）`,
+    okText: '立即安装',
+  });
+  if (!install) {
+    toast('已保存安装包，可稍后手动运行', '');
+    return;
+  }
+  const r = await window.bridge.update.install(res.filePath);
+  if (!r || !r.ok) toast('启动安装程序失败：' + ((r && r.error) || '未知错误'), 'err');
 }
 
 /* ================= 设置与启动 ================= */
@@ -519,7 +694,11 @@ function applyConfig(cfg) {
 async function boot() {
   const info = await window.bridge.info();
   state.version = info.version;
-  $('statVersion').textContent = `v${info.version} · Electron ${info.electron}`;
+  state.electron = info.electron;
+  state.updateBase = info.updateBase || '';
+  state.channel = info.updateChannel || 'stable';
+  renderChannelBadge();
+  renderVersionLabel();
   const cfg = await window.bridge.config.get();
   applyConfig(cfg);
   bindEvents();

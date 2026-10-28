@@ -1,0 +1,15 @@
+{
+  "name": "qingstor-client-update-server",
+  "version": "1.1.0",
+  "description": "qingStorClient 版本更新服务：对外只暴露更新 API，管理端仅回环（SSH 隧道）可访问",
+  "private": true,
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "init": "node server.js --init-only"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "license": "MIT"
+}

@@ -2,7 +2,7 @@
 
 青云对象存储（QingStor / S3 兼容）桌面客户端。网盘式浏览桶内文件与目录，支持多选、文件夹上传/下载、拖拽上传、传输队列与断点取消。
 
-> 当前版本 **2.0.0**：已从 Python + PyQt 实现整体迁移到 Electron，架构与打包方式对齐 `myApiTools`。
+> 当前版本 **0.0.1-dev**（处于 v0.0.x 开发期，只出开发包、不打正式标签）：已从 Python + PyQt 实现整体迁移到 Electron，架构与打包方式对齐 `myApiTools`。
 
 ## 功能特性
 
@@ -29,6 +29,7 @@ electron/
   config.js      配置读写（userData/config.json）
   s3.js          S3 封装：列举/新建/删除/上传/下载/连接测试
   transfers.js   传输队列（并发 2、进度节流推送、取消）
+  update.js      版本更新：渠道偏好（stable/dev）、检查最新版、下载安装包（sha256 校验），纯 Node
   names.js       key ↔ 本地路径的可逆转义（Windows 严格 / POSIX 宽松）
 renderer/
   index.html     单页外壳
@@ -38,6 +39,12 @@ renderer/
 tools/
   run-electron.js  启动器（剥离 ELECTRON_RUN_AS_NODE / NODE_OPTIONS）
   dist-win.ps1     Windows 打包脚本（镜像 + 预解压 Electron + 临时输出目录）
+server/              版本更新服务（独立部署，零 npm 依赖，见 server/README.md）
+  server.js        更新 API + 管理端，两个监听端口
+  admin.html       管理页（上传/列表/删除）
+  docker-publish.sh 镜像发布：一次构建，标签自动识别，同时推 Docker Hub 与阿里云 ACR
+  docker-publish.ps1  同上，Windows / PowerShell 版（参数一一对应）
+  deploy/          nginx 配置、Docker、部署文档
 .github/workflows/build.yml  三平台构建与 Release
 ```
 
@@ -59,8 +66,8 @@ npm run dist:win
 
 产物在 `dist/`：
 
-- `QingStorClient-Setup-2.0.0-x64.exe` —— NSIS 安装版（可选安装目录、创建快捷方式）
-- `QingStorClient-2.0.0-x64.exe` —— 免安装便携版
+- `QingStorClient-Setup-0.0.1-dev-x64.exe` —— NSIS 安装版（可选安装目录、创建快捷方式）
+- `QingStorClient-0.0.1-dev-x64.exe` —— 免安装便携版
 
 为什么不用 `npx electron-builder --win` 直接打：`tools/dist-win.ps1` 解决了两个本地必然会踩的坑。
 
@@ -75,40 +82,127 @@ mac / linux 打包需在对应系统上执行（`npm run dist:mac` / `dist:linux
 
 版本号写在 `package.json` 的 `version`，Electron 侧通过 `app.getVersion()` 展示在状态栏。**所有触发方式都围绕这一个字段**，不要在别处再维护版本号。
 
+### 版本阶段与分支约定（v0.0.x 开发期）
+
+当前版本是 `0.0.1-dev`，属于 **v0.0.x 开发期**。这个阶段的规则和正式版不一样：
+
+| | v0.0.x 开发期（现在） | 正式版（以后） |
+| --- | --- | --- |
+| 版本号 | 固定 `0.0.x-dev`，当前 `0.0.1-dev` | `x.y.z`，如 `1.0.0` |
+| 分支 | `ver/0.0` | `ver/<次版本>`，如 `ver/1.1` |
+| 打标签 | **不打**，没有正式发布计划 | 打 `v*` 标签 → 自动 Release |
+| 下发渠道 | 服务端 `channel=dev` | 服务端 `channel=stable` |
+
+几条配套约定：
+
+- **同版本反复重发是允许的**。服务端对「渠道 + 版本 + 平台 + 架构」采用覆盖语义，所以开发期改完直接重发 `0.0.1-dev` 即可，不必为了重发去 bump 版本号；要体现迭代进度再升 `0.0.2-dev` 这样。
+- **开发包进服务端要打 `channel=dev`**，客户端把右下角渠道徽标切到「开发版」才能收到（默认是 `stable`）。
+- **别随手打 `v*` 标签**。CI 的守卫要求标签名去掉 `v` 后与 `version` 严格相等，`0.0.1-dev` 要打就得打成 `v0.0.1-dev`；而且一旦打标签就会触发 Release，与「v0.0.x 不正式发布」冲突。
+- 客户端 `parseVersion` / 服务端 `parseVersion` 都认带 `-pre` 后缀的版本，`0.0.1-dev` 能正常参与比较（预发布版恒小于同号正式版）。
+
 ### 三档触发规则
 
 | 动作 | 产物性质 | 结果 |
 | --- | --- | --- |
-| 推 `v*` 标签（如 `v2.0.1`） | **正式包** | 三平台构建 → 自动创建 GitHub Release，安装包直接挂在页面上 |
-| 推 `ver/**` 分支（如 `ver/2.1`） | **开发包** | 三平台构建 → 只留在 Actions artifacts（保留 14 天），不发 Release |
+| 推 `v*` 标签（如 `v1.0.0`） | **正式包** | 三平台构建 → 自动创建 GitHub Release，安装包直接挂在页面上 |
+| 推 `ver/**` 分支（如 `ver/0.0`） | **开发包** | 三平台构建 → 只留在 Actions artifacts（保留 14 天），不发 Release |
 | 手动 Run workflow | **开发包** | 同上，适合验证任意提交而不污染版本历史 |
 
 开发包和正式包用的是同一份 `electron-builder.yml`、同一条构建命令，区别只在**有没有创建 Release**——判定条件就是 `release` job 的 `if: startsWith(github.ref, 'refs/tags/')`。所以开发包验证通过后再打标签，行为完全可预期。
 
 ### 正式发版
 
+> v0.0.x 开发期**不执行这一节**（不打标签）。以下是将来有正式发布计划时的流程。
+
 ```bash
-# 1. 改 package.json 的 version（如 2.0.1）
+# 1. 改 package.json 的 version（如 1.0.0）
 # 2. 提交
-git add -A && git commit -m "chore: release 2.0.1"
+git add -A && git commit -m "chore: release 1.0.0"
 git push
 # 3. 打标签并推送（标签必须和 version 一致，CI 会校验）
-git tag v2.0.1
-git push origin v2.0.1
+git tag v1.0.0
+git push origin v1.0.0
 ```
 
-- 标签名含 `-`（如 `v2.1.0-beta.1`）自动标记为 prerelease，不会顶掉 `latest`
+- 标签名含 `-`（如 `v1.1.0-beta.1`）自动标记为 prerelease，不会顶掉 `latest`
 - CI 有版本守卫：标签名去掉 `v` 后必须严格等于 `package.json` 的 `version`，不一致直接失败（避免「v2.0.1 的 Release 里挂着 2.0.0 的包」）
 - `version` 里带 `-dev.N` / `-beta.N` 后缀时，产物文件名也会带上，方便区分开发版与正式版
 
 ### 打开发包（不占版本号）
 
 ```bash
-git checkout -b ver/2.1
-git push -u origin ver/2.1      # 触发构建，产物在 Actions 页面下载
+git checkout -b ver/0.0
+git push -u origin ver/0.0      # 触发构建，产物在 Actions 页面下载
 ```
 
-验证没问题后合并回 `main`，再按上面的正式发版流程打标签。
+v0.0.x 开发期到此为止：**验证完不合并不打标签**，开发包直接从 Actions 取，或上传到服务端 `dev` 渠道分发给测试。等有正式发布计划时，再按上面的流程打 `v*` 标签。
+
+## 版本更新服务（`server/`）
+
+除了 GitHub Release，仓库里还带了一个自建的更新服务，用于「渠道隔离 + 同版本可覆盖重发 + sha256 校验」这三件 GitHub Release 做不了的事。零 npm 依赖，`node server.js` 直接跑，部署细节见 [server/README.md](server/README.md) 与 [server/deploy/README.md](server/deploy/README.md)。
+
+它的核心设计是**两个独立监听端口**，而不是一个端口按路径分流：
+
+| | 公网口（默认 8787 / 部署 8789） | 管理口（默认 8788 / 部署 8790） |
+| --- | --- | --- |
+| 绑定 | `0.0.0.0`，由 nginx 反代并终止 HTTPS | `127.0.0.1`，只能走 SSH 隧道 |
+| 路径 | `/`、`/api/health`、`/api/releases/latest`、`/api/releases/download/:id` | `/`、`/admin`、`/api/admin/*` |
+| 其余 | 一律 404 | 一律 404 |
+
+单端口方案只能靠"判断来源是不是回环 IP"保护管理端，一上 nginx 所有请求来源都变成 `127.0.0.1`，这道判断直接失效。拆成两个端口后，公网侧在物理上就不接受管理请求。
+
+日常发布：
+
+```bash
+# 1. 在自己的电脑上开隧道（公网没有任何入口能到管理端）
+ssh -N -L 8790:127.0.0.1:8790 user@your-server
+
+# 2. 浏览器打开 http://127.0.0.1:8790/admin，粘贴服务端 data/admin-token.txt 里的令牌
+# 3. 选安装包 → 从文件名自动填充版本/平台/架构 → 上传
+```
+
+客户端已经接入这个服务，更新服务的公网地址**内置在客户端里**：
+
+> `electron/update.js` → `DEFAULT_UPDATE_BASE = 'https://qingstorclient.myzhouye.com'`
+>
+> 联调别的环境时不用改代码，设 `QINGSTOR_UPDATE_BASE` 环境变量即可覆盖；渠道默认 `stable`，可在客户端界面里切换（见下方[渠道切换](#渠道切换stable--dev)），也可用 `QINGSTOR_UPDATE_CHANNEL` 指定初始值。服务端若配了 `UPDATE_API_KEY`，客户端用 `QINGSTOR_UPDATE_KEY` 带上。
+
+接口形态（客户端发出的请求就是这一条）：
+
+```bash
+curl "https://qingstorclient.myzhouye.com/api/releases/latest?platform=win&arch=x64&channel=dev&current=0.0.1-dev"
+# → { "updateAvailable": true, "latest": { "version": "0.0.2-dev", "sha256": "...", "downloadUrl": "..." } }
+```
+
+客户端的更新行为：
+
+| 时机 | 行为 |
+| --- | --- |
+| 启动后约 6 秒 | 静默探一次，**只有发现新版**才在状态栏标 `v0.0.1-dev → v0.0.2-dev 可更新` 并轻提示；网络不通则一声不响 |
+| 点右下角版本号 / 菜单「帮助 → 检查更新…」 | 主动检查，失败会明确报错 |
+| 发现新版 | 弹窗展示版本号、大小、更新时间与发版说明，由用户决定是否下载 |
+| 下载 | 落到 `userData/updates/<渠道>/`，先写 `.part`，边下边算 sha256，与接口返回的 `sha256` 比对通过才改名；可取消、进度实时 |
+| 下载完成 | **不静默替换自己**，弹窗询问是否立即运行安装程序（无签名，程序替换自己必被 SmartScreen / Gatekeeper 拦） |
+
+平台与架构取自 `process.platform` / `process.arch`，自动归一化成服务端认的 `win|mac|linux` 与 `x64|arm64|ia32|armv7l`。mac 的 arm64 与 x64 是两份包，传错架构会下载到跑不起来的安装包，所以这两个参数不做兜底猜测。
+
+### 渠道切换（stable / dev）
+
+服务端按 `channel` 隔离两条渠道，客户端自己就能切：
+
+| 入口 | 说明 |
+| --- | --- |
+| 状态栏渠道徽标 | 右下角 `stable` / `dev` 小徽标，点一下弹出两条渠道，当前项打勾 |
+| 菜单「帮助 → 更新渠道」 | 与徽标同一份状态，radio 勾选 |
+
+切换之后：
+
+- **立刻按新渠道重新检查一次**，状态栏的版本提示、`可更新` 标记全部换成该渠道的结果，旧渠道的「可更新」状态不会残留；
+- 偏好写在 `userData/update-channel.json`，与 S3 连接配置（`config.json`）分开——「清除连接配置」不会把渠道重置，改渠道也不会动连接信息；
+- 安装包按渠道分目录：`userData/updates/stable/`、`userData/updates/dev/`，两条渠道的同号包不会互相覆盖；
+- 初始值可由 `QINGSTOR_UPDATE_CHANNEL` 指定，用户手动切换后以文件为准。
+
+> dev 渠道发 `2.1.0-dev.3` 会被同号正式版顶掉吗？不会。版本比较沿用服务端语义：**预发布版恒小于同号正式版**（`2.1.0-dev.3 < 2.1.0`），但高于低号正式版（`2.1.0-dev.3 > 2.0.0`）。所以 dev 包能正常提示更新，也抢不走 stable 的版本；渠道隔离本身由 `channel` 参数完成。
 
 ## 跨平台产物
 
@@ -146,7 +240,7 @@ xattr -cr /Applications/QingStorClient.app
 - **无代码签名**：mac 未公证、Windows 未签名，用户首次打开需手动放行，详见 [macOS 安装包首次打开被拦（Gatekeeper）](#macos-安装包首次打开被拦gatekeeper)
 - **无自定义应用图标**：沿用 Electron 默认图标。放置 `build/icon.ico`（Windows）、`build/icon.icns`（macOS）、`build/icon.png`（Linux，512×512 以上）后重新打包即自动生效，无需改配置
 - **不支持交叉编译**：mac / linux 包必须在对应系统或 GitHub Actions 上构建
-- **无自动更新**：未接入 `electron-updater`，升级需重新下载安装包
+- **不做静默自动升级**：客户端已能从自建更新服务检查并下载新版本（见[版本更新服务](#版本更新服务-server)），但不会自行替换程序文件——无代码签名，静默替换必被 SmartScreen / Gatekeeper 拦。下载完由用户确认后运行安装程序
 
 
 ## 数据存放位置

@@ -1,0 +1,88 @@
+# =====================================================================
+# qingStorClient 更新服务 · docker compose
+# ---------------------------------------------------------------------
+# 关键点：两个端口都只发布到宿主机回环地址。
+#
+#   - 8789 给同机的 nginx 反代（proxy_pass http://127.0.0.1:8789）
+#   - 8790 只给你自己的 SSH 隧道（ssh -L 8790:127.0.0.1:8790）
+#
+# 端口刻意避开 8787/8788：同机上可能已经跑着 myApiTools 的服务端（占 8787），
+# 撞了以后 publicServer 监听失败会 process.exit(1)，整个容器起不来。
+# server.js 的代码默认值仍是 8787/8788，这里用环境变量覆盖。
+#
+# 写成 "127.0.0.1:8789:8789" 而不是 "8789:8789" 是故意的：
+# 后者相当于 docker 直接监听 0.0.0.0，绕过 ufw 把端口暴露到公网 ——
+# 这是 docker 用户最常踩的坑之一，iptables 规则会被 DOCKER 链提前接管。
+# =====================================================================
+
+services:
+  update:
+    # =================================================================
+    # 镜像来源：二选一
+    # -----------------------------------------------------------------
+    # 方案 A · 本地构建（当前启用）
+    #   改了 server/ 代码后：docker compose up -d --build
+    #
+    # 方案 B · 拉取已发布镜像（服务器上不需要源码和构建工具链）
+    #   做法：把下面 build / image 两行整个删掉，换成下面任意一行，
+    #        然后 docker compose pull && docker compose up -d
+    #
+    #   阿里云 ACR —— 境内 ECS 首选，Docker Hub 经常拉不动
+    #     image: registry.cn-hangzhou.aliyuncs.com/myzhouye/qingstorclient-server:1.1.0
+    #
+    #   Docker Hub —— 境外或备选
+    #     image: myzhouye/qingstorclient-server:1.1.0
+    #
+    #   tag 建议写固定版本号而不是 latest：docker images 能看出线上跑的是哪版，
+    #   回滚只需改这一行。latest 会跟着 docker-publish 一起动，事后无法追溯。
+    # =================================================================
+    build: .
+    image: qingstorclient-server:latest
+    container_name: qs-update
+    restart: unless-stopped
+
+    ports:
+      - "127.0.0.1:8789:8789"   # 更新 API → nginx
+      - "127.0.0.1:8790:8790"   # 管理端 → 只走 SSH 隧道
+
+    environment:
+      # 容器内监听端口，必须和上面 ports 右侧一致
+      PORT: "8789"
+      ADMIN_PORT: "8790"
+      # 容器内必须绑 0.0.0.0，否则端口映射进不来；
+      # 真正的隔离靠上面宿主机侧的 127.0.0.1 绑定。
+      HOST: "0.0.0.0"
+      ADMIN_HOST: "0.0.0.0"
+      TRUST_PROXY: "1"
+      # 对外访问前缀。填了以后 latest 接口返回的 downloadUrl 是绝对地址
+      # （https://域名/api/releases/download/12）；留空则只返回相对路径 /api/...
+      # ⚠️ 换成真实子域后再上线，否则客户端拿到的下载地址会指向 example.com
+      PUBLIC_ORIGIN: "https://update.example.com"
+      RELEASE_MAX_MB: "300"
+      RELEASE_CHANNEL: "stable"
+      # 容器内来自网桥网关（172.17.0.1 之类）的请求不是回环地址，
+      # 需要在这里声明受信网段，否则管理端会一律拒绝。
+      ADMIN_ALLOW_CIDR: "172.16.0.0/12"
+      # 管理令牌不写在这里：让它自动生成到 data/admin-token.txt，
+      # 首次启动后 `docker exec qs-update cat /app/data/admin-token.txt` 取。
+      # 想自己定就取消下面两行注释（注意别把令牌提交进仓库）。
+      # ADMIN_TOKEN: "换成你自己的长随机串"
+      # UPDATE_API_KEY: "可选，设了以后客户端要带 X-Api-Key"
+
+    volumes:
+      - ./data:/app/data
+
+    # 只读根文件系统：容器被攻破也改不了自己的代码。
+    # /app/data 是唯一可写卷，/tmp 留给 node 运行时。
+    read_only: true
+    tmpfs:
+      - /tmp
+
+    security_opt:
+      - no-new-privileges:true
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

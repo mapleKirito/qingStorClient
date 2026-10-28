@@ -244,6 +244,70 @@ export function closeContextMenu() {
   document.getElementById('ctxRoot').innerHTML = '';
 }
 
+/* ---------------- 更新相关弹窗 ---------------- */
+
+/** 发现新版本，resolve('download' | 'later') */
+export function updateAvailableDialog({ current, latest }) {
+  return new Promise((resolve) => {
+    const notes = latest.notes
+      ? `<div class="upd-notes">${esc(latest.notes).replace(/\n/g, '<br/>')}</div>`
+      : '';
+    const { mask, close } = openModal(`
+      <div class="modal" style="width:440px">
+        <div class="modal-head">
+          <div class="modal-title">发现新版本</div>
+          <button class="modal-close" data-close>✕</button>
+        </div>
+        <div class="modal-body">
+          <div class="upd-head">
+            <span class="upd-ver">v${esc(latest.version)}</span>
+            <span class="upd-from">当前 v${esc(current)}</span>
+          </div>
+          <div class="upd-meta">${esc(latest.channel)} 渠道 · ${esc(latest.platform)} · ${esc(latest.arch)} · ${esc(fmtBytes(latest.size))}${latest.publishedAt ? ' · ' + esc(fmtTime(new Date(latest.publishedAt).toISOString())) : ''}</div>
+          ${notes}
+          <div class="hint" style="margin-top:12px">下载完成后需手动运行安装包完成升级（程序未做代码签名，系统会弹一次安全提示）。</div>
+        </div>
+        <div class="modal-foot">
+          <button class="btn" data-close>以后再说</button>
+          <button class="btn primary" id="updGo">下载更新</button>
+        </div>
+      </div>`);
+    let done = false;
+    mask.querySelector('#updGo').addEventListener('click', () => { done = true; resolve('download'); close(); });
+    mask.addEventListener('mousedown', (e) => { if (e.target === mask && !done) resolve('later'); });
+    mask.querySelectorAll('[data-close]').forEach((b) => b.addEventListener('click', () => { if (!done) resolve('later'); }));
+  });
+}
+
+/** 下载进度弹窗，返回 { setProgress, setDetail, close } */
+export function updateProgressDialog({ version, onCancel }) {
+  const { mask, close } = openModal(`
+    <div class="modal" style="width:420px">
+      <div class="modal-head"><div class="modal-title">下载更新 v${esc(version)}</div></div>
+      <div class="modal-body">
+        <div class="pbar" style="height:8px"><div class="pbar-fill" id="updBar"></div></div>
+        <div class="upd-progress-line"><span id="updDetail">准备中…</span><span id="updPct">0%</span></div>
+      </div>
+      <div class="modal-foot"><button class="btn" id="updCancel">取消</button></div>
+    </div>`);
+  mask.querySelector('#updCancel').addEventListener('click', () => {
+    mask.querySelector('#updDetail').textContent = '正在取消…';
+    mask.querySelector('#updCancel').disabled = true;
+    onCancel && onCancel();
+  });
+  return {
+    setProgress(p) {
+      const pct = Math.max(0, Math.min(100, Math.round(Number(p && p.pct) || 0)));
+      mask.querySelector('#updBar').style.width = pct + '%';
+      mask.querySelector('#updPct').textContent = pct + '%';
+      mask.querySelector('#updDetail').textContent =
+        `${fmtBytes(p.received)}${p.total ? ' / ' + fmtBytes(p.total) : ''}`;
+    },
+    setDetail(text) { mask.querySelector('#updDetail').textContent = text; },
+    close,
+  };
+}
+
 /* ---------------- SVG/字符图标 ---------------- */
 export const ICONS = {
   dir: '📁',

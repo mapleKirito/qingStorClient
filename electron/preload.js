@@ -47,6 +47,32 @@ contextBridge.exposeInMainWorld('bridge', {
     },
   },
 
+  update: {
+    info: () => ipcRenderer.invoke('update:info'),
+    check: () => ipcRenderer.invoke('update:check'),
+    channel: () => ipcRenderer.invoke('update:channel'),
+    setChannel: (channel) => ipcRenderer.invoke('update:setChannel', channel),
+    download: (latest) => ipcRenderer.invoke('update:download', latest),
+    cancel: () => ipcRenderer.invoke('update:cancel'),
+    install: (filePath) => ipcRenderer.invoke('update:install', filePath),
+    reveal: (filePath) => ipcRenderer.invoke('update:reveal', filePath),
+    onProgress: (handler) => {
+      const listener = (_e, p) => handler(p);
+      ipcRenderer.on('update:progress', listener);
+      return () => ipcRenderer.removeListener('update:progress', listener);
+    },
+    onAvailable: (handler) => {
+      const listener = (_e, r) => handler(r);
+      ipcRenderer.on('update:available', listener);
+      return () => ipcRenderer.removeListener('update:available', listener);
+    },
+    onChannel: (handler) => {
+      const listener = (_e, channel) => handler(channel);
+      ipcRenderer.on('update:channel', listener);
+      return () => ipcRenderer.removeListener('update:channel', listener);
+    },
+  },
+
   onMenu: (handler) => {
     const listener = (_e, payload) => handler(payload);
     ipcRenderer.on('menu', listener);

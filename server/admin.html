@@ -1,0 +1,555 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>qingStorClient 更新服务 · 管理端</title>
+<style>
+  :root {
+    --bg: #16181d; --bg-2: #1d2026; --bg-3: #23262e; --bg-4: #2a2e37;
+    --border: #2c3038; --border-2: #383d47;
+    --text: #e6e8ec; --text-2: #a8aeba; --text-3: #6f7683;
+    --accent: #6d8bff; --ok: #4ade80; --warn: #fbbf24; --danger: #f87171;
+    --radius: 8px;
+  }
+  * { box-sizing: border-box; }
+  /* [hidden] 必须能压过下面的 display:flex —— 浏览器给 [hidden] 的 display:none
+     优先级比类选择器低，漏了这条 #gate / #app 的显隐切换会整个失效
+     （表现是输完令牌闸门不消失，看起来"没反应"，控制台却零报错）。 */
+  [hidden] { display: none !important; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 13px/1.6 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .mono { font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; }
+  a { color: var(--accent); }
+  code {
+    font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+    font-size: 12px; background: var(--bg-3); padding: 1px 5px; border-radius: 4px;
+  }
+  button {
+    font: inherit; cursor: pointer; border-radius: 6px;
+    border: 1px solid var(--border-2); background: var(--bg-3); color: var(--text);
+    padding: 6px 12px; transition: .12s;
+  }
+  button:hover:not(:disabled) { border-color: var(--accent); color: #fff; }
+  button:disabled { opacity: .45; cursor: default; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #0d0f13; font-weight: 600; }
+  button.primary:hover:not(:disabled) { filter: brightness(1.1); color: #0d0f13; }
+  button.danger { color: var(--danger); border-color: rgba(248,113,113,.35); background: transparent; }
+  button.danger:hover:not(:disabled) { background: rgba(248,113,113,.12); border-color: var(--danger); }
+  button.mini { padding: 3px 8px; font-size: 11.5px; border-radius: 5px; }
+  input, select, textarea {
+    font: inherit; background: var(--bg); color: var(--text);
+    border: 1px solid var(--border-2); border-radius: 6px; padding: 7px 10px; outline: none;
+    width: 100%;
+  }
+  input:focus, select:focus, textarea:focus { border-color: var(--accent); }
+  textarea { resize: vertical; min-height: 62px; }
+  label { display: block; font-size: 11.5px; color: var(--text-3); margin-bottom: 5px; }
+
+  /* ---------- 令牌闸门 ---------- */
+  #gate { display: flex; min-height: 100vh; align-items: center; justify-content: center; padding: 24px; }
+  #gate .box {
+    width: 100%; max-width: 430px; background: var(--bg-2);
+    border: 1px solid var(--border); border-radius: 12px; padding: 26px 26px 22px;
+  }
+  #gate h1 { margin: 0 0 6px; font-size: 17px; }
+  #gate p { margin: 0 0 18px; color: var(--text-2); font-size: 12.5px; line-height: 1.75; }
+  #gate input { margin-bottom: 12px; }
+  #gate button { width: 100%; }
+  #gateErr { color: var(--danger); font-size: 12.5px; min-height: 20px; margin-top: 10px; }
+
+  /* ---------- 主体 ---------- */
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 22px 20px 70px; }
+  header.top {
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    padding-bottom: 14px; margin-bottom: 18px; border-bottom: 1px solid var(--border);
+  }
+  header.top h1 { margin: 0; font-size: 16px; font-weight: 600; }
+  header.top .tag {
+    font-size: 11px; padding: 1px 7px; border-radius: 20px;
+    background: rgba(109,139,255,.13); color: var(--accent); border: 1px solid rgba(109,139,255,.3);
+  }
+  header.top .spacer { flex: 1; }
+  .stats { display: flex; gap: 22px; flex-wrap: wrap; margin-left: 6px; }
+  .stats div { font-size: 12px; color: var(--text-3); }
+  .stats b { color: var(--text); font-weight: 600; }
+
+  .card {
+    background: var(--bg-2); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 18px 18px 16px; margin-bottom: 18px;
+  }
+  .card > h2 {
+    margin: 0 0 4px; font-size: 13.5px; font-weight: 600;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .card > .hint { margin: 0 0 16px; font-size: 12px; color: var(--text-3); line-height: 1.7; }
+
+  .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+  .grid .full { grid-column: 1 / -1; }
+  @media (max-width: 760px) { .grid { grid-template-columns: repeat(2, 1fr); } }
+
+  .drop {
+    border: 1px dashed var(--border-2); border-radius: var(--radius);
+    padding: 16px; text-align: center; color: var(--text-3); font-size: 12.5px;
+    cursor: pointer; transition: .12s; background: var(--bg);
+  }
+  .drop:hover, .drop.over { border-color: var(--accent); color: var(--text-2); background: var(--bg-3); }
+  .drop b { color: var(--text); }
+  .drop .file { color: var(--accent); }
+
+  .bar { height: 4px; background: var(--bg-4); border-radius: 3px; overflow: hidden; margin-top: 12px; }
+  .bar > i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .15s; }
+  .progressText { font-size: 12px; color: var(--text-2); margin-top: 7px; min-height: 18px; }
+  .progressText.err { color: var(--danger); }
+  .progressText.ok { color: var(--ok); }
+
+  .actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 14px; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+  th { color: var(--text-3); font-weight: 500; font-size: 11.5px; text-transform: uppercase; letter-spacing: .04em; }
+  tbody tr:hover { background: var(--bg-3); }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .pill {
+    display: inline-block; font-size: 11px; padding: 0 7px; border-radius: 20px;
+    background: var(--bg-4); color: var(--text-2); border: 1px solid var(--border-2);
+  }
+  .pill.stable { color: var(--ok); border-color: rgba(74,222,128,.3); background: rgba(74,222,128,.1); }
+  .pill.dev { color: var(--warn); border-color: rgba(251,191,36,.3); background: rgba(251,191,36,.1); }
+  .fname { max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .empty { padding: 26px; text-align: center; color: var(--text-3); font-size: 12.5px; }
+  .row-actions { display: flex; gap: 6px; justify-content: flex-end; }
+
+  .toast {
+    position: fixed; left: 50%; bottom: 26px; transform: translateX(-50%) translateY(20px);
+    background: var(--bg-4); border: 1px solid var(--border-2); color: var(--text);
+    padding: 9px 16px; border-radius: 22px; font-size: 12.5px; opacity: 0;
+    transition: .2s; pointer-events: none; max-width: 80vw;
+  }
+  .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+  .toast.err { border-color: rgba(248,113,113,.45); color: var(--danger); }
+</style>
+</head>
+<body>
+
+<!-- ---------------- 令牌闸门 ---------------- -->
+<div id="gate">
+  <div class="box">
+    <h1>qingStorClient 更新服务</h1>
+    <p>
+      管理端绑定在服务端回环地址上，正常情况下你应该是通过 SSH 隧道打开的：
+      <br /><code>ssh -N -L 8790:127.0.0.1:8790 user@server</code>
+      <br />（若服务端改过 <code>ADMIN_PORT</code>，以启动时控制台打印的隧道命令为准）
+      <br />令牌在服务端 <code>data/admin-token.txt</code>，或由 <code>ADMIN_TOKEN</code> 环境变量提供。
+    </p>
+    <input id="gateInput" type="password" placeholder="管理令牌" autocomplete="off" spellcheck="false" />
+    <button class="primary" id="gateBtn">进入管理端</button>
+    <div id="gateErr"></div>
+  </div>
+</div>
+
+<!-- ---------------- 主体 ---------------- -->
+<div id="app" class="wrap" hidden>
+  <header class="top">
+    <h1>安装包发布</h1>
+    <span class="tag" id="serverVersion">v-</span>
+    <div class="stats">
+      <div>版本数 <b id="statTotal">0</b></div>
+      <div>总占用 <b id="statBytes">0</b></div>
+      <div>单包上限 <b id="statMax">-</b></div>
+    </div>
+    <div class="spacer"></div>
+    <button class="mini" id="reloadBtn">刷新</button>
+    <button class="mini" id="logoutBtn">退出</button>
+  </header>
+
+  <section class="card">
+    <h2>发布新版本</h2>
+    <p class="hint">
+      同一个「渠道 + 版本 + 平台 + 架构」重复上传会覆盖旧记录并删除旧文件，dev 渠道可以放心反复重发。
+      上传走原始字节流，边收边算 sha256，下载时客户端可校验完整性。
+    </p>
+    <div class="grid">
+      <div>
+        <label>渠道</label>
+        <input id="fChannel" value="stable" spellcheck="false" />
+      </div>
+      <div>
+        <label>版本号</label>
+        <input id="fVersion" placeholder="2.0.1" spellcheck="false" />
+      </div>
+      <div>
+        <label>平台</label>
+        <select id="fPlatform">
+          <option value="win">win</option>
+          <option value="mac">mac</option>
+          <option value="linux">linux</option>
+        </select>
+      </div>
+      <div>
+        <label>架构</label>
+        <select id="fArch">
+          <option value="x64">x64</option>
+          <option value="arm64">arm64</option>
+          <option value="ia32">ia32</option>
+          <option value="armv7l">armv7l</option>
+        </select>
+      </div>
+      <div class="full">
+        <label>发布说明（可选，会出现在客户端的更新提示里）</label>
+        <textarea id="fNotes" placeholder="修复 xxx；新增 yyy"></textarea>
+      </div>
+      <div class="full">
+        <label>安装包</label>
+        <div class="drop" id="drop">
+          点击选择，或把文件拖到这里 · <b>当前：</b><span class="file" id="fileName">未选择</span>
+        </div>
+        <input id="fFile" type="file" hidden />
+        <div class="bar"><i id="bar"></i></div>
+        <div class="progressText" id="progressText"></div>
+      </div>
+    </div>
+    <div class="actions">
+      <button id="fillFromFileBtn">从文件名自动填充</button>
+      <button class="primary" id="uploadBtn">上传并发布</button>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>已发布版本</h2>
+    <p class="hint" id="releasesHint"></p>
+    <table>
+      <thead>
+        <tr>
+          <th>渠道</th><th>版本</th><th>平台</th><th>文件</th>
+          <th class="num">大小</th><th class="num">下载</th><th>发布时间</th><th></th>
+        </tr>
+      </thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <div class="empty" id="emptyHint" hidden>还没有发布任何版本</div>
+  </section>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+(function () {
+  'use strict';
+
+  var API = '/api/admin';
+  var token = '';
+
+  var $ = function (id) { return document.getElementById(id); };
+
+  var toastTimer = null;
+  function toast(msg, isErr) {
+    var el = $('toast');
+    el.textContent = msg;
+    el.className = 'toast show' + (isErr ? ' err' : '');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () { el.className = 'toast'; }, 3200);
+  }
+
+  function fmtBytes(n) {
+    if (!n) return '0 B';
+    var u = ['B', 'KB', 'MB', 'GB', 'TB'];
+    var i = Math.floor(Math.log(n) / Math.log(1024));
+    i = Math.max(0, Math.min(i, u.length - 1));
+    return (n / Math.pow(1024, i)).toFixed(i === 0 ? 0 : 1) + ' ' + u[i];
+  }
+  function fmtTime(ms) {
+    var d = new Date(ms);
+    var p = function (x) { return x < 10 ? '0' + x : '' + x; };
+    return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) +
+      ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
+  }
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+
+  /** 统一带令牌请求，401 直接退回闸门 */
+  function api(path, opts) {
+    opts = opts || {};
+    var headers = Object.assign({ 'X-Admin-Token': token }, opts.headers || {});
+    return fetch(API + path, Object.assign({}, opts, { headers: headers }))
+      .then(function (r) {
+        if (r.status === 401) {
+          throw Object.assign(new Error('管理令牌无效或已变更'), { auth: true });
+        }
+        return r.json().catch(function () {
+          throw new Error('服务端返回的不是 JSON（HTTP ' + r.status + '）');
+        });
+      })
+      .then(function (j) {
+        if (!j.ok) throw new Error(j.error || '请求失败');
+        return j;
+      });
+  }
+
+  /* ---------------- 闸门 ---------------- */
+  function tryEnter(tk) {
+    token = tk;
+    return api('/whoami').then(function (info) {
+      sessionStorage.setItem('qs_admin_token', tk);
+      $('gate').hidden = true;
+      $('app').hidden = false;
+      applyInfo(info);
+      return load();
+    }).catch(function (e) {
+      token = '';
+      sessionStorage.removeItem('qs_admin_token');
+      throw e;
+    });
+  }
+
+  function applyInfo(info) {
+    $('serverVersion').textContent = 'server v' + info.serverVersion;
+    $('statMax').textContent = info.maxMb + ' MB';
+    $('fChannel').value = info.defaultChannel || 'stable';
+    $('releasesHint').textContent =
+      '安装包目录：' + info.releasesDir +
+      (info.publicOrigin ? ' · 对外地址：' + info.publicOrigin : '');
+  }
+
+  $('gateBtn').onclick = function () {
+    var tk = $('gateInput').value.trim();
+    if (!tk) { $('gateErr').textContent = '请输入管理令牌'; return; }
+    $('gateErr').textContent = '';
+    $('gateBtn').disabled = true;
+    tryEnter(tk).catch(function (e) {
+      $('gateErr').textContent = e.message || '无法连接';
+    }).then(function () { $('gateBtn').disabled = false; });
+  };
+  $('gateInput').addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') $('gateBtn').click();
+  });
+
+  $('logoutBtn').onclick = function () {
+    token = '';
+    sessionStorage.removeItem('qs_admin_token');
+    $('app').hidden = true;
+    $('gate').hidden = false;
+    $('gateInput').value = '';
+  };
+
+  /* ---------------- 列表 ---------------- */
+  function load() {
+    return api('/releases').then(function (j) {
+      $('statTotal').textContent = j.total;
+      $('statBytes').textContent = fmtBytes(j.totalBytes);
+      $('statMax').textContent = j.maxMb + ' MB';
+      var rows = $('rows');
+      rows.innerHTML = '';
+      $('emptyHint').hidden = j.releases.length > 0;
+
+      j.releases.forEach(function (r) {
+        var tr = document.createElement('tr');
+        tr.innerHTML =
+          '<td><span class="pill ' + esc(r.channel) + '">' + esc(r.channel) + '</span></td>' +
+          '<td class="mono">' + esc(r.version) + '</td>' +
+          '<td>' + esc(r.platform) + ' · ' + esc(r.arch) + '</td>' +
+          '<td class="fname mono" title="' + esc(r.fileName) + '">' + esc(r.fileName) + '</td>' +
+          '<td class="num">' + fmtBytes(r.size) + '</td>' +
+          '<td class="num">' + r.downloads + '</td>' +
+          '<td class="mono" style="color:var(--text-3)">' + fmtTime(r.publishedAt) + '</td>' +
+          '<td><div class="row-actions">' +
+          '<button class="mini" data-act="url">地址</button>' +
+          '<button class="mini danger" data-act="del">删除</button>' +
+          '</div></td>';
+
+        tr.querySelector('[data-act="url"]').onclick = function () {
+          var url = r.downloadUrl || (location.origin + '/api/releases/download/' + r.id);
+          if (navigator.clipboard) {
+            navigator.clipboard.writeText(url).then(function () {
+              toast('已复制下载地址');
+            }, function () { toast(url); });
+          } else {
+            toast(url);
+          }
+        };
+
+        tr.querySelector('[data-act="del"]').onclick = function () {
+          if (!confirm('删除 ' + r.channel + '/' + r.version + ' ' + r.platform + '-' + r.arch +
+            ' ？\n文件会一并从磁盘删除，不可恢复。')) return;
+          api('/releases/' + r.id, { method: 'DELETE' }).then(function () {
+            toast('已删除');
+            return load();
+          }).catch(function (e) { toast(e.message, true); });
+        };
+
+        rows.appendChild(tr);
+      });
+    }).catch(function (e) {
+      if (e.auth) { $('logoutBtn').onclick(); $('gateErr').textContent = e.message; return; }
+      toast(e.message, true);
+    });
+  }
+  $('reloadBtn').onclick = function () { load().then(function () { toast('已刷新'); }); };
+
+  /* ---------------- 选择文件 / 自动填充 ---------------- */
+  var picked = null;
+
+  function setPicked(f) {
+    picked = f || null;
+    $('fileName').textContent = f ? f.name + '（' + fmtBytes(f.size) + '）' : '未选择';
+  }
+
+  $('drop').onclick = function () { $('fFile').click(); };
+  $('fFile').onchange = function () { setPicked(this.files && this.files[0]); };
+
+  ['dragenter', 'dragover'].forEach(function (ev) {
+    $('drop').addEventListener(ev, function (e) {
+      e.preventDefault();
+      $('drop').classList.add('over');
+    });
+  });
+  ['dragleave', 'drop'].forEach(function (ev) {
+    $('drop').addEventListener(ev, function (e) {
+      e.preventDefault();
+      $('drop').classList.remove('over');
+    });
+  });
+  $('drop').addEventListener('drop', function (e) {
+    var f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+    if (f) setPicked(f);
+  });
+
+  /**
+   * 从文件名推断版本 / 平台 / 架构。
+   * electron-builder 的产物形如：
+   *   QingStorClient-Setup-2.0.0-x64.exe
+   *   QingStorClient-2.0.0-arm64.dmg
+   *   qingstor-client_2.0.0_amd64.deb
+   * 只做尽力而为的猜测，猜不到就留空让用户自己填 —— 猜错比不猜更麻烦。
+   */
+  $('fillFromFileBtn').onclick = function () {
+    if (!picked) { toast('先选一个安装包', true); return; }
+    var n = picked.name.toLowerCase();
+    var m = /(\d+\.\d+\.\d+(?:-[0-9a-z.]+)?)/.exec(n);
+    if (m) $('fVersion').value = m[1];
+
+    if (/\.exe$/.test(n)) $('fPlatform').value = 'win';
+    else if (/\.dmg$/.test(n)) $('fPlatform').value = 'mac';
+    else if (/\.(appimage|deb|rpm|tar\.gz)$/.test(n)) $('fPlatform').value = 'linux';
+
+    if (/arm64|aarch64/.test(n)) $('fArch').value = 'arm64';
+    else if (/ia32|x86_32|i386/.test(n)) $('fArch').value = 'ia32';
+    else if (/armv7/.test(n)) $('fArch').value = 'armv7l';
+    else if (/x64|x86_64|amd64/.test(n)) $('fArch').value = 'x64';
+
+    if (!$('fVersion').value) { toast('没能从文件名里识别出版本号，请手动填写', true); }
+    else { toast('已填充：' + $('fVersion').value + ' · ' + $('fPlatform').value + ' · ' + $('fArch').value); }
+  };
+
+  /* ---------------- 上传 ---------------- */
+  /**
+   * 用 XHR 而不是 fetch：只有 XHR 能拿到 upload.onprogress，
+   * 上百 MB 的安装包不给进度条，用户会以为卡死而重复点。
+   * body 直接传 File 对象，浏览器会流式发送，不会把整个文件读进内存。
+   */
+  $('uploadBtn').onclick = function () {
+    if (!picked) { toast('先选一个安装包', true); return; }
+    var version = $('fVersion').value.trim();
+    if (!/^v?\d+\.\d+\.\d+(-[0-9a-zA-Z.]+)?$/.test(version)) {
+      toast('版本号必须形如 2.0.1（可带 -beta.1 后缀）', true);
+      return;
+    }
+    var channel = $('fChannel').value.trim() || 'stable';
+    var platform = $('fPlatform').value;
+    var arch = $('fArch').value;
+    var notes = $('fNotes').value;
+
+    var qs = '?version=' + encodeURIComponent(version) +
+      '&channel=' + encodeURIComponent(channel) +
+      '&platform=' + encodeURIComponent(platform) +
+      '&arch=' + encodeURIComponent(arch) +
+      '&notes=' + encodeURIComponent(notes) +
+      // 文件名走 base64url：中文名塞进 URL 或 Header 都容易乱码
+      '&name=' + encodeURIComponent(b64url(picked.name));
+
+    var btn = $('uploadBtn');
+    btn.disabled = true;
+    setProgress(0, '准备上传…', '');
+
+    var xhr = new XMLHttpRequest();
+    xhr.open('PUT', API + '/releases' + qs);
+    xhr.setRequestHeader('X-Admin-Token', token);
+    xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+
+    xhr.upload.onprogress = function (e) {
+      if (!e.lengthComputable) return;
+      var pct = Math.round(e.loaded / e.total * 100);
+      setProgress(pct, '上传中 ' + pct + '%（' + fmtBytes(e.loaded) + ' / ' + fmtBytes(e.total) + '）', '');
+    };
+
+    xhr.onload = function () {
+      btn.disabled = false;
+      var j = null;
+      try { j = JSON.parse(xhr.responseText); } catch (_) { /* 非 JSON，下面按状态码处理 */ }
+      if (xhr.status === 401) {
+        setProgress(0, '管理令牌无效', 'err');
+        $('logoutBtn').onclick();
+        $('gateErr').textContent = '管理令牌无效或已变更';
+        return;
+      }
+      if (!j || !j.ok) {
+        setProgress(0, '发布失败：' + (j && j.error ? j.error : 'HTTP ' + xhr.status), 'err');
+        return;
+      }
+      setProgress(100, (j.replaced ? '已覆盖发布 ' : '已发布 ') +
+        j.release.channel + '/' + j.release.version + ' ' +
+        j.release.platform + '-' + j.release.arch + '（sha256 ' +
+        j.release.sha256.slice(0, 12) + '…）', 'ok');
+      toast(j.replaced ? '已覆盖发布' : '发布成功');
+      setPicked(null);
+      $('fFile').value = '';
+      $('fVersion').value = '';
+      $('fNotes').value = '';
+      load();
+    };
+
+    xhr.onerror = function () {
+      btn.disabled = false;
+      setProgress(0, '网络错误：连接被中断（可能是反代 body 上限或隧道断开）', 'err');
+    };
+    xhr.ontimeout = function () {
+      btn.disabled = false;
+      setProgress(0, '上传超时', 'err');
+    };
+
+    xhr.send(picked);
+  };
+
+  function setProgress(pct, text, kind) {
+    $('bar').style.width = pct + '%';
+    var el = $('progressText');
+    el.textContent = text;
+    el.className = 'progressText' + (kind ? ' ' + kind : '');
+  }
+
+  function b64url(s) {
+    var bytes = new TextEncoder().encode(s);
+    var bin = '';
+    for (var i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+    return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  }
+
+  /* ---------------- 自动进入 ---------------- */
+  var saved = sessionStorage.getItem('qs_admin_token');
+  if (saved) {
+    tryEnter(saved).catch(function () {
+      sessionStorage.removeItem('qs_admin_token');
+    });
+  } else {
+    $('gateInput').focus();
+  }
+})();
+</script>
+</body>
+</html>

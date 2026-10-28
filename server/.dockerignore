@@ -1,0 +1,34 @@
+# 构建上下文是 server/，这里要挡掉的是「绝不能进镜像」的东西
+#
+# data/ 里有三样东西，任何一个进镜像都是事故：
+#   releases.db      运行期数据库
+#   admin-token.txt  管理令牌（相当于管理端密码）
+#   releases/        用户上传的安装包
+#
+# Dockerfile 用的是精确 COPY（只拷 package.json / server.js / admin.html），
+# 所以 data/ 本来就不会进镜像；但构建上下文仍会被整体发给 daemon，
+# 一个几百 MB 的安装包目录会让每次构建都先卡传文件。这里一并挡掉。
+data/
+*.db
+*.db-wal
+*.db-shm
+admin-token.txt
+
+# 镜像发布脚本自己不参与构建
+docker-publish.sh
+.dockerignore
+
+# 依赖与产物
+node_modules/
+npm-debug.log*
+
+# VCS / 编辑器 / 系统
+.git/
+.gitignore
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# 文档不进运行镜像
+*.md

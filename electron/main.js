@@ -9,6 +9,7 @@ const { ConfigStore } = require('./config');
 const { TransferManager } = require('./transfers');
 const names = require('./names');
 const s3 = require('./s3');
+const update = require('./update');
 
 const RENDERER_DIR = path.join(__dirname, '..', 'renderer');
 const APP_SCHEME = 'app';
@@ -22,6 +23,7 @@ if (SMOKE) {
 }
 
 const configStore = new ConfigStore(app.getPath('userData'));
+const channelStore = new update.ChannelStore(app.getPath('userData'));
 const transfers = new TransferManager();
 let mainWindow = null;
 
@@ -146,6 +148,15 @@ function buildMenu() {
       label: '帮助',
       submenu: [
         { label: '连接设置…', click: () => send({ action: 'settings' }) },
+        { label: '检查更新…', click: () => send({ action: 'check-update' }) },
+        {
+          label: '更新渠道',
+          submenu: [
+            { label: '正式版（stable）', type: 'radio', checked: channelStore.get() === 'stable', click: () => setUpdateChannel('stable') },
+            { label: '开发版（dev）', type: 'radio', checked: channelStore.get() === 'dev', click: () => setUpdateChannel('dev') },
+          ],
+        },
+        { type: 'separator' },
         {
           label: '关于',
           click: () => {
@@ -164,6 +175,61 @@ function buildMenu() {
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
 }
 
+/* ---------------- 更新：检查 / 下载 / 安装 ---------------- */
+
+const updateState = { checking: false, downloading: false, abort: null };
+
+function updateRoot() {
+  return update.defaultInstallDir(app.getPath('userData'));
+}
+
+/** 安装包按渠道分目录（updates/stable、updates/dev），两个渠道的同号包不会互相覆盖 */
+function updateDir(channel) {
+  return path.join(updateRoot(), update.resolveChannel(channel || channelStore.get()));
+}
+
+async function checkUpdate() {
+  if (updateState.checking) return { ok: false, error: '正在检查更新，请稍候' };
+  updateState.checking = true;
+  try {
+    return await update.checkForUpdates({ current: app.getVersion(), channel: channelStore.get() });
+  } finally {
+    updateState.checking = false;
+  }
+}
+
+/** 切换渠道：落盘 → 重建菜单（radio 勾选要跟着变）→ 通知界面重新检查 */
+function setUpdateChannel(channel) {
+  const c = channelStore.set(channel);
+  // 放到下一个 tick 重建菜单：避免在菜单自身的事件处理里销毁当前菜单
+  setImmediate(() => buildMenu());
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('update:channel', c);
+  return c;
+}
+
+async function downloadUpdate(latest) {
+  if (updateState.downloading) return { ok: false, error: '已有安装包正在下载' };
+  updateState.downloading = true;
+  updateState.abort = new AbortController();
+  const notify = (p) => {
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('update:progress', p);
+  };
+  try {
+    return await update.downloadInstaller({ latest, dir: updateDir(latest.channel), signal: updateState.abort.signal, onProgress: notify });
+  } finally {
+    updateState.downloading = false;
+    updateState.abort = null;
+  }
+}
+
+/** 启动后静默探一次：有新版才提示，网络不通就一声不响（不打扰用户） */
+async function silentCheckUpdate() {
+  const r = await checkUpdate().catch(() => null);
+  if (r && r.ok && r.updateAvailable && mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('update:available', r);
+  }
+}
+
 /* ---------------- IPC ---------------- */
 function requireConfig() {
   if (configStore.isEmpty) throw new Error('尚未配置连接，请先在设置中填写');
@@ -177,6 +243,8 @@ function registerIpc() {
     electron: process.versions.electron,
     userData: app.getPath('userData'),
     configured: !configStore.isEmpty,
+    updateBase: update.resolveBase(),
+    updateChannel: channelStore.get(),
   }));
 
   ipcMain.handle('config:get', () => configStore.data);
@@ -288,6 +356,63 @@ function registerIpc() {
   ipcMain.handle('transfer:list', () => transfers.list());
   ipcMain.handle('transfer:cancel', (_e, id) => transfers.cancel(id));
   ipcMain.handle('transfer:clear', () => transfers.clearFinished());
+
+  // ---- 更新 ----
+  ipcMain.handle('update:info', () => ({
+    base: update.resolveBase(),
+    channel: channelStore.get(),
+    channelLabel: update.CHANNEL_LABELS[channelStore.get()] || channelStore.get(),
+    channels: [...update.CHANNELS],
+    platform: update.platformTag(),
+    arch: update.archTag(),
+    current: app.getVersion(),
+    dir: updateDir(),
+  }));
+
+  ipcMain.handle('update:check', () => checkUpdate());
+
+  ipcMain.handle('update:channel', () => ({ channel: channelStore.get() }));
+
+  ipcMain.handle('update:setChannel', (_e, channel) => {
+    try {
+      return { ok: true, channel: setUpdateChannel(channel) };
+    } catch (e) {
+      return { ok: false, error: e.message || String(e) };
+    }
+  });
+
+  ipcMain.handle('update:download', (_e, latest) => {
+    if (!latest || !latest.downloadUrl) return { ok: false, error: '缺少安装包信息' };
+    return downloadUpdate(latest);
+  });
+
+  ipcMain.handle('update:cancel', () => {
+    if (updateState.abort) updateState.abort.abort();
+    return { ok: true };
+  });
+
+  // 只允许启动「下载目录内」的安装包：渲染进程传来的路径属于不可信输入
+  ipcMain.handle('update:install', async (_e, filePath) => {
+    const root = path.resolve(updateRoot());
+    const target = path.resolve(String(filePath || ''));
+    const rel = path.relative(root, target);
+    if (!target || rel.startsWith('..') || path.isAbsolute(rel)) {
+      return { ok: false, error: '安装包路径非法' };
+    }
+    if (!fs.existsSync(target)) return { ok: false, error: '安装包不存在，请重新下载' };
+    const err = await shell.openPath(target);
+    return err ? { ok: false, error: err } : { ok: true };
+  });
+
+  ipcMain.handle('update:reveal', (_e, filePath) => {
+    const root = path.resolve(updateRoot());
+    const target = path.resolve(String(filePath || ''));
+    const rel = path.relative(root, target);
+    if (!target || rel.startsWith('..') || path.isAbsolute(rel)) return { ok: false, error: '路径非法' };
+    if (fs.existsSync(target)) shell.showItemInFolder(target);
+    else shell.openPath(root);
+    return { ok: true };
+  });
 }
 
 /* ---------------- 生命周期 ---------------- */
@@ -304,11 +429,14 @@ if (!gotLock) {
 
   app.whenReady().then(() => {
     configStore.load();
+    channelStore.load();
     global.__qingCfg = configStore.isEmpty ? null : configStore.data;
     registerAppProtocol();
     registerIpc();
     buildMenu();
     transfers.attachWindow(createWindow());
+    // 启动后静默探一次更新（冒烟测试不联网）
+    if (!SMOKE) setTimeout(() => { silentCheckUpdate(); }, 6000);
 
     app.on('activate', () => {
       if (BrowserWindow.getAllWindows().length === 0) transfers.attachWindow(createWindow());
