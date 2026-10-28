@@ -174,7 +174,10 @@ content-disposition: attachment; filename="QingStorClient-Setup-2.0.1-x64.exe"; 
 2. **写在客户端里的密钥没有防护作用。** Electron 包里翻出一个 `X-Api-Key` 只是几分钟的事，加了会让人误以为"已经保护起来了"。
 3. **真正需要防护的是"谁能发布"，不是"谁能下载"。** 发布口在隧道后面 + 32 字节令牌 + 限流，这才是攻击面所在。
 
-如果确实需要（比如内部灰度、不想让外人下载），设 `UPDATE_API_KEY`，之后更新 API 必须带 `X-Api-Key` 头。但要清楚这只是"增加一点门槛"，不是安全边界。
+> 早先还有一个可选的 `UPDATE_API_KEY` / `X-Api-Key` 开关，**已移除**。原因不只是"没多大用"：
+> 客户端的密钥来源是环境变量，打包后双击启动根本读不到，服务端一旦开启，所有已发布的客户端
+> 会在下次检查更新时全部 401，而用户没有任何自助修复的办法。真要控制未授权下载，用对象存储的
+> 预签名 URL（短 TTL、每次现签、无法长期复用），不要加静态密钥。
 
 公网侧另有按 IP 的限流：查询 300 次/分钟，下载 60 次/分钟。目的是防扫描和防被当免费 CDN 刷，不是为了挡正常用户。
 
@@ -297,7 +300,6 @@ docker login registry.cn-hangzhou.aliyuncs.com
 | `TRUST_PROXY` | `0` | nginx 后面设 `1`，否则统计到的全是 `127.0.0.1` |
 | `RELEASE_MAX_MB` | `300` | 单包上限 |
 | `RELEASE_CHANNEL` | `stable` | 默认渠道 |
-| `UPDATE_API_KEY` | 空 | 设了以后更新 API 需要 `X-Api-Key` |
 | `ADMIN_HOST` | `127.0.0.1` | 管理侧绑定地址，**不建议改** |
 | `ADMIN_PORT` | `8788` | 管理侧端口。**Docker/systemd 部署用 `8790`**（镜像已设） |
 | `ADMIN_TOKEN` | 空 | 显式指定令牌，优先于文件 |

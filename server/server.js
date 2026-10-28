@@ -47,8 +47,6 @@
  * 发布
  *   RELEASE_MAX_MB    单包上限（MB），默认 300
  *   RELEASE_CHANNEL   默认渠道，默认 stable
- *   UPDATE_API_KEY    可选。设了以后更新 API 需要 X-Api-Key 头。
- *                     默认空 = 不校验，原因见 README「为什么更新 API 不做鉴权」
  *
  * 管理端
  *   ADMIN_HOST        默认 127.0.0.1。改成 0.0.0.0 会让管理端暴露到网络，
@@ -96,7 +94,6 @@ const RELEASES_DIR = path.resolve(process.env.RELEASES_DIR || path.join(DATA_DIR
 
 const PUBLIC_ORIGIN = String(process.env.PUBLIC_ORIGIN || '').trim().replace(/\/+$/, '');
 const TRUST_PROXY = process.env.TRUST_PROXY === '1';
-const UPDATE_API_KEY = String(process.env.UPDATE_API_KEY || '').trim();
 
 const RELEASE_MAX_MB = Number(process.env.RELEASE_MAX_MB || 300);
 const RELEASE_MAX_BYTES = RELEASE_MAX_MB * 1024 * 1024;
@@ -326,6 +323,38 @@ function parseVersion(v) {
 }
 
 /**
+ * 预发布标识符比较（按 SemVer 2.0 第 11 条）：
+ *   - 按 '.' 切段后逐段比，数字段按数值比（dev.9 < dev.10），字母段按 ASCII 比
+ *   - 数字段优先级低于字母段（1.0.0-1 < 1.0.0-alpha）
+ *   - 前缀全等时，段数少的更小（1.0.0-dev < 1.0.0-dev.1）
+ *
+ * 为什么不能直接 `x.pre < y.pre`：那是字符串比较，'dev.10' < 'dev.9' 会成立，
+ * 开发迭代到第 10 个版本号时客户端会误判「已是最新」，静默收不到更新。
+ */
+function comparePrerelease(a, b) {
+  const xa = String(a).split('.');
+  const xb = String(b).split('.');
+  const len = Math.max(xa.length, xb.length);
+  for (let i = 0; i < len; i += 1) {
+    const sa = xa[i];
+    const sb = xb[i];
+    if (sa === undefined) return -1;
+    if (sb === undefined) return 1;
+    if (sa === sb) continue;
+    const na = /^\d+$/.test(sa);
+    const nb = /^\d+$/.test(sb);
+    if (na && nb) {
+      const d = Number(sa) - Number(sb);
+      if (d !== 0) return d < 0 ? -1 : 1;
+      continue;
+    }
+    if (na !== nb) return na ? -1 : 1;
+    return sa < sb ? -1 : 1;
+  }
+  return 0;
+}
+
+/**
  * a 比 b 新返回 >0，相同返回 0，更旧返回 <0。
  * 任一侧非法时返回 0（「无法比较」按相等处理：宁可不提示更新，也不误报）。
  */
@@ -340,7 +369,7 @@ function compareVersion(a, b) {
   if (x.pre === y.pre) return 0;
   if (!x.pre) return 1;
   if (!y.pre) return -1;
-  return x.pre < y.pre ? -1 : 1;
+  return comparePrerelease(x.pre, y.pre);
 }
 
 /** 平台与架构归一化，容忍客户端传 windows / darwin / x86_64 这类写法 */
@@ -485,11 +514,6 @@ function pickLatestRelease(channel, platform, arch) {
 /* ------------------------------------------------------------------ *
  * 公网侧：更新 API
  * ------------------------------------------------------------------ */
-function apiKeyAllowed(req) {
-  if (!UPDATE_API_KEY) return true;
-  const given = String(req.headers['x-api-key'] || '').trim();
-  return !!given && safeEqual(given, UPDATE_API_KEY);
-}
 
 /**
  * GET / —— 服务自述。公网根路径与管理侧根路径都返回它。
@@ -939,10 +963,6 @@ function handlePublic(req, res) {
   }
 
   if (!p.startsWith('/api/releases')) return notFound(res);
-
-  if (!apiKeyAllowed(req)) {
-    return fail(res, 401, '缺少或错误的 X-Api-Key', 'UNAUTHORIZED');
-  }
 
   if (p === '/api/releases/latest' && (req.method === 'GET' || req.method === 'HEAD')) {
     return handleReleaseLatest(req, res, url.searchParams);

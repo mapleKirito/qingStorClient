@@ -80,6 +80,8 @@ mac / linux 打包需在对应系统上执行（`npm run dist:mac` / `dist:linux
 
 ## 版本与发布
 
+> 完整规范见 **[docs/VERSIONING.md](docs/VERSIONING.md)**（版本位判定、分支生命周期、标签规则、发版/热修复全流程、检查清单）。本节只做速查，两者冲突时以 `docs/VERSIONING.md` 为准。
+
 版本号写在 `package.json` 的 `version`，Electron 侧通过 `app.getVersion()` 展示在状态栏。**所有触发方式都围绕这一个字段**，不要在别处再维护版本号。
 
 ### 版本阶段与分支约定（v0.0.x 开发期）
@@ -88,24 +90,24 @@ mac / linux 打包需在对应系统上执行（`npm run dist:mac` / `dist:linux
 
 | | v0.0.x 开发期（现在） | 正式版（以后） |
 | --- | --- | --- |
-| 版本号 | 固定 `0.0.x-dev`，当前 `0.0.1-dev` | `x.y.z`，如 `1.0.0` |
-| 分支 | `ver/0.0` | `ver/<次版本>`，如 `ver/1.1` |
+| 版本号 | `0.0.x-dev`，当前 `0.0.1-dev`（z 当开发迭代号用） | `x.y.z`，如 `1.0.0` |
+| 分支 | **无版本分支**：直接提交 `main`，本机手动构建 | `ver/<x.y>`，如 `ver/1.0`（不带 patch） |
 | 打标签 | **不打**，没有正式发布计划 | 打 `v*` 标签 → 自动 Release |
 | 下发渠道 | 服务端 `channel=dev` | 服务端 `channel=stable` |
 
 几条配套约定：
 
-- **同版本反复重发是允许的**。服务端对「渠道 + 版本 + 平台 + 架构」采用覆盖语义，所以开发期改完直接重发 `0.0.1-dev` 即可，不必为了重发去 bump 版本号；要体现迭代进度再升 `0.0.2-dev` 这样。
+- **同版本反复重发是允许的**。服务端对「渠道 + 版本 + 平台 + 架构」采用覆盖语义，所以开发期改完直接重发 `0.0.1-dev` 即可，不必为了重发去 bump 版本号；要区分「第几次构建」再加序号（`0.0.1-dev.1`、`-dev.2`……，序号无上限）。
 - **开发包进服务端要打 `channel=dev`**，客户端把右下角渠道徽标切到「开发版」才能收到（默认是 `stable`）。
 - **别随手打 `v*` 标签**。CI 的守卫要求标签名去掉 `v` 后与 `version` 严格相等，`0.0.1-dev` 要打就得打成 `v0.0.1-dev`；而且一旦打标签就会触发 Release，与「v0.0.x 不正式发布」冲突。
-- 客户端 `parseVersion` / 服务端 `parseVersion` 都认带 `-pre` 后缀的版本，`0.0.1-dev` 能正常参与比较（预发布版恒小于同号正式版）。
+- 客户端 `parseVersion` / 服务端 `parseVersion` 都认带 `-pre` 后缀的版本，预发布段按 SemVer 2.0 逐段比较（数字段按数值比，`dev.9 < dev.10`），预发布版恒小于同号正式版。
 
 ### 三档触发规则
 
 | 动作 | 产物性质 | 结果 |
 | --- | --- | --- |
 | 推 `v*` 标签（如 `v1.0.0`） | **正式包** | 三平台构建 → 自动创建 GitHub Release，安装包直接挂在页面上 |
-| 推 `ver/**` 分支（如 `ver/0.0`） | **开发包** | 三平台构建 → 只留在 Actions artifacts（保留 14 天），不发 Release |
+| 推 `ver/**` 分支（如 `ver/1.0`） | **开发包** | 三平台构建 → 只留在 Actions artifacts（保留 14 天），不发 Release |
 | 手动 Run workflow | **开发包** | 同上，适合验证任意提交而不污染版本历史 |
 
 开发包和正式包用的是同一份 `electron-builder.yml`、同一条构建命令，区别只在**有没有创建 Release**——判定条件就是 `release` job 的 `if: startsWith(github.ref, 'refs/tags/')`。所以开发包验证通过后再打标签，行为完全可预期。
@@ -115,27 +117,62 @@ mac / linux 打包需在对应系统上执行（`npm run dist:mac` / `dist:linux
 > v0.0.x 开发期**不执行这一节**（不打标签）。以下是将来有正式发布计划时的流程。
 
 ```bash
-# 1. 改 package.json 的 version（如 1.0.0）
-# 2. 提交
-git add -A && git commit -m "chore: release 1.0.0"
-git push
-# 3. 打标签并推送（标签必须和 version 一致，CI 会校验）
-git tag v1.0.0
+# 0. 前置：功能已冻结，开发包在目标平台验证通过
+# 1. 在版本线上把版本号定为正式版（只去掉 -dev 后缀，不升位）
+git checkout ver/1.0
+#    编辑 package.json + package-lock.json：1.0.0-dev → 1.0.0
+git commit -am "chore(release): 1.0.0"
+git push origin ver/1.0
+
+# 2. 打标签并推送（这一步才真正触发发布，CI 会校验 tag 与 version 严格相等）
+git tag -a v1.0.0 -m "QingStorClient 1.0.0"
 git push origin v1.0.0
+
+# 3. 合并进 main，让 main 永远等于最新正式版
+git checkout main && git pull
+git merge --no-ff ver/1.0
+git push origin main
+
+# 4. 校验 tag 已进入 main
+git merge-base --is-ancestor v1.0.0 main && echo OK
+
+# 5. Release 出包 → 下载 → 上传更新服务 stable 渠道
+# 6. 版本线保留，后续 z 补丁（1.0.1）继续在同一条分支上做，分支名不变
+#    （前提：该线仍是最新版本线；一旦开了 ver/1.1，1.0 即终止维护，不再出补丁）
 ```
 
 - 标签名含 `-`（如 `v1.1.0-beta.1`）自动标记为 prerelease，不会顶掉 `latest`
-- CI 有版本守卫：标签名去掉 `v` 后必须严格等于 `package.json` 的 `version`，不一致直接失败（避免「v2.0.1 的 Release 里挂着 2.0.0 的包」）
+- CI 有版本守卫：标签名去掉 `v` 后必须严格等于 `package.json` 的 `version`，不一致直接失败（避免「v1.0.0 的 Release 里挂着 1.0.0-dev 的包」）
 - `version` 里带 `-dev.N` / `-beta.N` 后缀时，产物文件名也会带上，方便区分开发版与正式版
+- **正式版发出去就不能覆盖重发**（老用户 `current == latest`，永远收不到），有问题只能升 z 发新版本
+- **只给当前最新版本线打标签**：旧版本线一旦被下一个 `x.y` 取代就终止维护，不再出补丁、不再打任何 `v*` 标签
 
-### 打开发包（不占版本号）
+### 开新版本 / 打开发包（不占版本号）
 
 ```bash
-git checkout -b ver/0.0
-git push -u origin ver/0.0      # 触发构建，产物在 Actions 页面下载
+# 1. 定目标版本：加功能 → y+1；破坏性变更 → x+1；z 从 0 起
+# 2. 从 main 拉版本线，并把 version 改成 x.y.0-dev
+git checkout main && git pull
+git checkout -b ver/1.0
+#    编辑 package.json + package-lock.json → "1.0.0-dev"
+git commit -am "chore: 开启 1.0.0 开发"
+# 3. 推送触发构建，产物在 Actions 页面下载
+git push -u origin ver/1.0
 ```
 
-v0.0.x 开发期到此为止：**验证完不合并不打标签**，开发包直接从 Actions 取，或上传到服务端 `dev` 渠道分发给测试。等有正式发布计划时，再按上面的流程打 `v*` 标签。
+开发期内版本号不用动：同一目标版本反复构建都用 `1.0.0-dev`，需要区分构建轮次再加序号（`1.0.0-dev.1`）。临时功能分支用 `feat/`、`fix/`、`chore/` 前缀，推送不触发构建，完成后再合进版本线。
+
+**同一时刻只维护一条版本线。** `ver/1.1` 一旦创建，`ver/1.0` 就终止维护——不删、历史保留，但不再接收提交、不出补丁、不打标签。缺陷修复永远落在当前最新的 `ver/x.y` 上；老用户报的旧版本问题，先在新版本确认，仍存在就按 `z+1` 修在新版本里。详细理由与禁止事项见 [`docs/VERSIONING.md` 第 5.5 节](docs/VERSIONING.md)。
+
+**当前 `0.0.1-dev` 是初始开发版，不走上面这条路径。** 它直接住在 `main` 上：没有版本分支、不推 CI、不打标签，产物在**本机手动构建**：
+
+```bash
+npm run dist:win      # Windows：NSIS 安装版 + 便携版
+npm run dist:mac      # macOS
+npm run dist:linux    # Linux
+```
+
+产物落在 `dist/`，文件名带版本号（`QingStorClient-Setup-0.0.1-dev-x64.exe`、`QingStorClient-0.0.1-dev-x64.exe`），可直接分发给测试，或上传更新服务 `dev` 渠道。等出现第一个正式版本计划时，才从 `main` 拉 `ver/x.y` 按上面的流程走，详见 [`docs/VERSIONING.md` 1.3.1](docs/VERSIONING.md)。
 
 ## 版本更新服务（`server/`）
 
@@ -165,7 +202,7 @@ ssh -N -L 8790:127.0.0.1:8790 user@your-server
 
 > `electron/update.js` → `DEFAULT_UPDATE_BASE = 'https://qingstorclient.myzhouye.com'`
 >
-> 联调别的环境时不用改代码，设 `QINGSTOR_UPDATE_BASE` 环境变量即可覆盖；渠道默认 `stable`，可在客户端界面里切换（见下方[渠道切换](#渠道切换stable--dev)），也可用 `QINGSTOR_UPDATE_CHANNEL` 指定初始值。服务端若配了 `UPDATE_API_KEY`，客户端用 `QINGSTOR_UPDATE_KEY` 带上。
+> 联调别的环境时不用改代码，设 `QINGSTOR_UPDATE_BASE` 环境变量即可覆盖；渠道默认 `stable`，可在客户端界面里切换（见下方[渠道切换](#渠道切换stable--dev)），也可用 `QINGSTOR_UPDATE_CHANNEL` 指定初始值。更新 API 不做鉴权，客户端不带任何密钥头。
 
 接口形态（客户端发出的请求就是这一条）：
 

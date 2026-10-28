@@ -105,6 +105,38 @@ function parseVersion(v) {
   return { major: Number(m[1]), minor: Number(m[2]), patch: Number(m[3]), pre: m[4] || '' };
 }
 
+/**
+ * 预发布标识符比较（按 SemVer 2.0 第 11 条）：
+ *   - 按 '.' 切段后逐段比，数字段按数值比（dev.9 < dev.10），字母段按 ASCII 比
+ *   - 数字段优先级低于字母段（1.0.0-1 < 1.0.0-alpha）
+ *   - 前缀全等时，段数少的更小（1.0.0-dev < 1.0.0-dev.1）
+ *
+ * 为什么不能直接 `x.pre < y.pre`：那是字符串比较，'dev.10' < 'dev.9' 会成立，
+ * 开发迭代到第 10 个版本号时客户端会误判「已是最新」，静默收不到更新。
+ */
+function comparePrerelease(a, b) {
+  const xa = String(a).split('.');
+  const xb = String(b).split('.');
+  const len = Math.max(xa.length, xb.length);
+  for (let i = 0; i < len; i += 1) {
+    const sa = xa[i];
+    const sb = xb[i];
+    if (sa === undefined) return -1;
+    if (sb === undefined) return 1;
+    if (sa === sb) continue;
+    const na = /^\d+$/.test(sa);
+    const nb = /^\d+$/.test(sb);
+    if (na && nb) {
+      const d = Number(sa) - Number(sb);
+      if (d !== 0) return d < 0 ? -1 : 1;
+      continue;
+    }
+    if (na !== nb) return na ? -1 : 1;
+    return sa < sb ? -1 : 1;
+  }
+  return 0;
+}
+
 /** 与服务端 compareVersion 同一套语义：预发布版恒小于同号正式版（1.2.0-beta < 1.2.0） */
 function compareVersion(a, b) {
   const x = parseVersion(a);
@@ -116,16 +148,18 @@ function compareVersion(a, b) {
   if (x.pre === y.pre) return 0;
   if (!x.pre) return 1;
   if (!y.pre) return -1;
-  return x.pre < y.pre ? -1 : 1;
+  return comparePrerelease(x.pre, y.pre);
 }
 
 /* ---------------- 网络辅助 ---------------- */
 
-function requestHeaders(apiKey) {
-  const headers = { accept: 'application/json' };
-  const key = String(apiKey || process.env.QINGSTOR_UPDATE_KEY || '').trim();
-  if (key) headers['x-api-key'] = key;
-  return headers;
+/**
+ * 更新 API 不做鉴权，客户端不带任何密钥头。
+ * 安装包本身不是机密，写在客户端里的密钥也拦不住想提取的人 ——
+ * 详见 server/README「为什么公网更新 API 不做鉴权」。
+ */
+function requestHeaders() {
+  return { accept: 'application/json' };
 }
 
 /** 把 fetch 的底层错误翻译成用户能看懂的一句话（undici 把真实原因藏在 e.cause 里） */
@@ -187,7 +221,7 @@ async function checkForUpdates(opts = {}) {
   let resp;
   try {
     resp = await fetch(url, {
-      headers: requestHeaders(opts.apiKey),
+      headers: requestHeaders(),
       redirect: 'follow',
       signal: AbortSignal.timeout(timeoutMs),
     });
@@ -293,7 +327,7 @@ async function downloadInstaller(opts = {}) {
   let resp;
   try {
     resp = await fetch(latest.downloadUrl, {
-      headers: requestHeaders(opts.apiKey),
+      headers: requestHeaders(),
       redirect: 'follow',
       signal: opts.signal || AbortSignal.timeout(Number(opts.timeoutMs) || 30 * 60 * 1000),
     });

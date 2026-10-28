@@ -67,7 +67,6 @@ services:
       # 首次启动后 `docker exec qs-update cat /app/data/admin-token.txt` 取。
       # 想自己定就取消下面两行注释（注意别把令牌提交进仓库）。
       # ADMIN_TOKEN: "换成你自己的长随机串"
-      # UPDATE_API_KEY: "可选，设了以后客户端要带 X-Api-Key"
 
     volumes:
       - ./data:/app/data
