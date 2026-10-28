@@ -1,6 +1,6 @@
 {
   "name": "qingstor-client",
-  "version": "0.0.1-dev",
+  "version": "0.0.1-dev.1",
   "description": "青云对象存储桌面客户端：网盘式管理文件与目录，支持多选/文件夹上传下载",
   "author": "mapleKirito",
   "main": "electron/main.js",
@@ -8,6 +8,7 @@
   "scripts": {
     "start": "node tools/run-electron.js",
     "smoke": "node tools/run-electron.js --smoke",
+    "version:bump": "node tools/bump-version.js",
     "dist": "electron-builder --config electron-builder.yml",
     "dist:win": "powershell -ExecutionPolicy Bypass -File tools/dist-win.ps1",
     "dist:mac": "electron-builder --mac --config electron-builder.yml",

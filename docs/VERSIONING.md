@@ -139,15 +139,46 @@ SemVer 原文规定 `0.y.z` 为初始开发阶段，「任何东西都可能随�
 
 ### 1.5 改版本号的操作规程
 
-- **单独一个提交**，不与功能代码混在一起：`chore(release): 1.2.0`。
-- 改完立刻核对两处一致：
+**唯一入口是脚本，不要手改文件。** 版本号在两个文件里各出现一次（`package.json` 的 `version`、`package-lock.json` 的顶层与 `packages[""]`），手改必然漏；脚本会同步改、写完自检、并拒绝非法结果：
 
 ```bash
-node -p "require('./package.json').version"
-grep -m2 '"version"' package-lock.json     # 应为同一个值
+npm run version:bump -- show      # 当前版本 / 分支 / 是否 dev
+npm run version:bump -- x         # 1.2.3-dev -> 2.0.0-dev   破坏性更新
+npm run version:bump -- y         # 1.2.3-dev -> 1.3.0-dev   功能更新
+npm run version:bump -- z         # 1.2.3-dev -> 1.2.4-dev   缺陷修复
+npm run version:bump -- dev       # 1.2.3-dev -> 1.2.3-dev.1 开发序号 +1
+npm run version:bump -- release   # 1.2.3-dev.1 -> 1.2.3     去 -dev 转正式版
+npm run version:bump -- set 1.4.0-dev.3   # 兜底：指定精确版本
 ```
 
-- 客户端与服务端是**两套独立版本号**，各改各的：`package.json`（客户端）与 `server/package.json`（服务端），互不牵连。
+常用参数：`-n/--dry-run` 只看不写、`--dev` / `--no-dev` 强制加或去掉 `-dev`、`-c/--commit` 改完自动提交、`-f/--force` 越过校验。脚本改完会打印下一步该跑的命令。
+
+几条硬性行为（`tools/bump-version.js` 实现）：
+
+| 行为 | 说明 |
+| --- | --- |
+| 数字位递增**默认保留 dev 状态** | `1.2.3-dev` 跑 `z` 得 `1.2.4-dev`，不会把开发版意外变成正式版；要发布必须显式跑 `release` |
+| 对正式版跑 `dev` 直接报错 | `1.0.0` 加 `-dev` 会得到更低的 `1.0.0-dev`，客户端不认作升级；提示改用 `z --dev` |
+| `release` 遇到已存在的 `vX.Y.Z` 标签拒绝 | 正式版不允许覆盖重发（第 4 节） |
+| 在 `ver/x.y` 上改成别的 `x.y` 拒绝 | 对应约束 3，需 `--force` 才放行 |
+| `package-lock.json` 只改根两处 | 依赖自身的版本号一概不动；靠缩进 + 原值精确定位，不整文件重排 |
+| 两文件版本已不同步时 | 以 `package.json` 为准把 lock 一起改齐，并给出警告 |
+
+**`dev` 动作 vs `--dev` 参数，别混用**——前者是动作（在已有开发号上递增序号），后者是给 `x/y/z` 递增结果加后缀的参数：
+
+| 当前版本 | 想干什么 | 命令 | 结果 |
+| --- | --- | --- | --- |
+| `1.2.1-dev` | 本轮再构建一次，用序号区分 | `dev` | `1.2.1-dev.1` |
+| `1.2.0`（正式版） | 开下一轮开发 | `z --dev` | `1.2.1-dev` |
+| `1.2.0`（正式版） | 加功能开新版本线 | `y --dev` | `1.3.0-dev` |
+| `1.2.0`（正式版） | 只发补丁、不进开发版 | `z --no-dev` | `1.2.1` |
+| `1.2.1-dev` | 定版发布 | `release` | `1.2.1` |
+
+**为什么正式版不许直接跑 `dev`**：`1.2.0` 加 `-dev` 得到的 `1.2.0-dev` 比 `1.2.0` **更低**（1.4 节：同号预发布版恒小于正式版）。这样推上去，装 `1.2.0` 的用户查更新时 `current > latest`，判定「已是最新」，**没有任何正式版用户收得到这个开发包**，而你在开发机上又一切正常——极难排查。所以脚本拒绝这次操作，把正确命令打给你。
+
+- **单独一个提交**，不与功能代码混在一起：`chore(release): 1.2.0`（`--commit` 会自动按这个格式提交）。
+- 脚本**不会**打标签，也不会合并分支——那两步会触发 CI 出正式包，必须由人确认。
+- 客户端与服务端是**两套独立版本号**，各改各的：本脚本只管客户端 `package.json`，服务端走 `server/package.json`。
 
 ---
 
@@ -277,8 +308,8 @@ tag=v1.2.0  package.json=1.2.0-dev  → 失败（这也正是 v0.0.x 阶段不�
 git checkout main && git pull
 git checkout -b ver/1.3
 
-# 2. 把版本号改成开发版：x.y.0-dev（根 package.json + package-lock.json 两处）
-#    "version": "1.3.0-dev"
+# 2. 改成开发版版本号：x.y.0-dev（脚本同步两个文件，不要手改）
+npm run version:bump -- y --dev     # 1.2.0 -> 1.3.0-dev
 git add package.json package-lock.json
 git commit -m "chore: 开启 1.3.0 开发"
 
@@ -317,7 +348,7 @@ git push -u origin ver/1.3
 ```bash
 # ── 1. 在版本线上把版本号定为正式版（只去掉 -dev 后缀，不升位）
 git checkout ver/1.3 && git pull
-#    编辑 package.json 与 package-lock.json：1.3.0-dev → 1.3.0
+npm run version:bump -- release     # 1.3.0-dev -> 1.3.0
 git add package.json package-lock.json
 git commit -m "chore(release): 1.3.0"
 
@@ -358,7 +389,7 @@ git checkout ver/1.3 && git pull
 git commit -am "fix: 修复 XXX 崩溃"
 
 # ── 2. 更新 z，并按需加 -dev 先走开发版验证
-#    "version": "1.3.1-dev"
+npm run version:bump -- z --dev            # 1.3.0 -> 1.3.1-dev（不改功能时直接去掉 --dev）
 git commit -am "chore: 开启 1.3.1 补丁"
 git push origin ver/1.3                    # → 开发包
 
@@ -366,7 +397,7 @@ git push origin ver/1.3                    # → 开发包
 #      改动小、可确定时可以直接跳到第 4 步
 
 # ── 4. 定版并发布 x.y.z
-#    "version": "1.3.1"
+npm run version:bump -- release            # 1.3.1-dev -> 1.3.1
 git commit -am "chore(release): 1.3.1"
 git push origin ver/1.3
 git tag -a v1.3.1 -m "QingStorClient 1.3.1"
@@ -512,7 +543,7 @@ cd server
 | # | 约束 | 违规后果 |
 | --- | --- | --- |
 | 1 | 版本号只在三个时刻改：开启新版本（`x.y.0-dev`）、定版发布（去掉 `-dev`）、发补丁（`z+1`）。其余时间不动 | 版本线混乱，产物无法区分 |
-| 2 | 改 `version` 必须同改 `package-lock.json` 的两处 | `npm ci` 失败，CI 红 |
+| 2 | 改 `version` 一律用 `npm run version:bump -- <x\|y\|z\|dev\|release>`，禁止手改文件 | 漏改 lock 的一处 → `npm ci` 失败，CI 红 |
 | 3 | 分支名必须是 `ver/<x.y>`，且 `x.y` 与当前 `version` 的前两位一致（**唯一例外**：初始开发版 `0.0.1-dev` 在 `main` 上，无版本分支，见 1.3.1） | 分支与版本脱节 |
 | 4 | 长期分支只有 `main` 和 `ver/*`；临时分支用 `feat/`、`fix/`、`chore/`、`docs/`、`refactor/`（**不设 `hotfix/`**） | 误触发三平台构建；多出一条旧线维护路径 |
 | 5 | 打标签前 `version` 必须无 `-dev` / `-beta` 等后缀（预发布标签除外） | `0.0.1-dev` 打标签 = 违反开发期约定 |
@@ -525,7 +556,8 @@ cd server
 ### 9.2 操作后自检（每次动版本号或打标签后跑）
 
 ```bash
-# 1. 版本号与 lock 是否一致
+# 1. 版本号与 lock 是否一致（脚本已保证，这里复核一遍）
+npm run --silent version:bump -- show
 node -p "require('./package.json').version"
 grep -m2 '"version"' package-lock.json
 

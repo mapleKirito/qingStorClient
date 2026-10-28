@@ -39,6 +39,7 @@ renderer/
 tools/
   run-electron.js  启动器（剥离 ELECTRON_RUN_AS_NODE / NODE_OPTIONS）
   dist-win.ps1     Windows 打包脚本（镜像 + 预解压 Electron + 临时输出目录）
+  bump-version.js  版本号工具（npm run version:bump，同步两个文件并自检）
 server/              版本更新服务（独立部署，零 npm 依赖，见 server/README.md）
   server.js        更新 API + 管理端，两个监听端口
   admin.html       管理页（上传/列表/删除）
@@ -84,6 +85,22 @@ mac / linux 打包需在对应系统上执行（`npm run dist:mac` / `dist:linux
 
 版本号写在 `package.json` 的 `version`，Electron 侧通过 `app.getVersion()` 展示在状态栏。**所有触发方式都围绕这一个字段**，不要在别处再维护版本号。
 
+**改版本号用脚本，不要手改文件**（它同步改 `package.json` 与 `package-lock.json` 根两处，写完自检）：
+
+```bash
+npm run version:bump -- show       # 当前版本 / 分支 / 是否 dev
+npm run version:bump -- x          # 破坏性更新   1.2.3-dev -> 2.0.0-dev
+npm run version:bump -- y          # 功能更新     1.2.3-dev -> 1.3.0-dev
+npm run version:bump -- z          # 缺陷修复     1.2.3-dev -> 1.2.4-dev
+npm run version:bump -- dev        # 开发序号 +1  1.2.3-dev -> 1.2.3-dev.1
+npm run version:bump -- release    # 转正式版     1.2.3-dev.1 -> 1.2.3
+npm run version:bump -- z --dev    # 从正式版进开发版  1.2.3 -> 1.2.4-dev
+```
+
+数字位递增**默认保留 `-dev`**（开发版不会意外变成正式版），发布必须显式跑 `release`；加 `-n` 只看不写，`-c` 改完自动提交。
+
+**`dev` 动作只递增已有开发号**，对正式版会报错——`1.2.3` 加 `-dev` 得到的 `1.2.3-dev` 比正式版还低，客户端判定「已是最新」，推上去没人收得到。要从正式版进下一轮开发，用 `z --dev`（或 `y --dev` / `x --dev`）。完整规则见 [`docs/VERSIONING.md`](docs/VERSIONING.md#15-改版本号的操作规程)。
+
 ### 版本阶段与分支约定（v0.0.x 开发期）
 
 当前版本是 `0.0.1-dev`，属于 **v0.0.x 开发期**。这个阶段的规则和正式版不一样：
@@ -120,7 +137,7 @@ mac / linux 打包需在对应系统上执行（`npm run dist:mac` / `dist:linux
 # 0. 前置：功能已冻结，开发包在目标平台验证通过
 # 1. 在版本线上把版本号定为正式版（只去掉 -dev 后缀，不升位）
 git checkout ver/1.0
-#    编辑 package.json + package-lock.json：1.0.0-dev → 1.0.0
+npm run version:bump -- release          # 1.0.0-dev -> 1.0.0
 git commit -am "chore(release): 1.0.0"
 git push origin ver/1.0
 
@@ -151,13 +168,14 @@ git merge-base --is-ancestor v1.0.0 main && echo OK
 
 ```bash
 # 1. 定目标版本：加功能 → y+1；破坏性变更 → x+1；z 从 0 起
-# 2. 从 main 拉版本线，并把 version 改成 x.y.0-dev
+# 2. 从 main 拉版本线（分支名只带 x.y，不带 patch）
 git checkout main && git pull
-git checkout -b ver/1.0
-#    编辑 package.json + package-lock.json → "1.0.0-dev"
-git commit -am "chore: 开启 1.0.0 开发"
-# 3. 推送触发构建，产物在 Actions 页面下载
-git push -u origin ver/1.0
+git checkout -b ver/1.1
+# 3. 版本号改成 x.y.0-dev（脚本同步 package.json 与 package-lock.json）
+npm run version:bump -- y --dev          # 1.0.0 -> 1.1.0-dev
+git commit -am "chore: 开启 1.1.0 开发"
+# 4. 推送触发构建，产物在 Actions 页面下载
+git push -u origin ver/1.1
 ```
 
 开发期内版本号不用动：同一目标版本反复构建都用 `1.0.0-dev`，需要区分构建轮次再加序号（`1.0.0-dev.1`）。临时功能分支用 `feat/`、`fix/`、`chore/` 前缀，推送不触发构建，完成后再合进版本线。
@@ -187,6 +205,8 @@ npm run dist:linux    # Linux
 | 其余 | 一律 404 | 一律 404 |
 
 单端口方案只能靠"判断来源是不是回环 IP"保护管理端，一上 nginx 所有请求来源都变成 `127.0.0.1`，这道判断直接失效。拆成两个端口后，公网侧在物理上就不接受管理请求。
+
+安装包默认存在 `server/data/releases`（`local` 驱动）。也可以设 `STORAGE_DRIVER=s3` 切到对象存储：本地只留版本索引，下载时 302 跳到短时预签名地址（默认 5 分钟）。两种驱动可以共存——每条记录自带 `storage` 字段，切换后存量包仍按各自的位置下载。配置与权限建议见 [server/README.md](server/README.md) 的「对象存储」一节。
 
 日常发布：
 
