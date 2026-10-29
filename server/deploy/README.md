@@ -136,7 +136,7 @@ docker exec qs-update cat /app/data/admin-token.txt
 cd server && ./docker-publish.sh
 
 # 服务器上把 compose 的 build 去掉，换成 image
-#   image: registry.cn-hangzhou.aliyuncs.com/myzhouye/qingstorclient-server:1.2.1
+#   image: registry.cn-hangzhou.aliyuncs.com/myzhouye/qingstorclient-server:1.3.0
 docker compose pull && docker compose up -d
 ```
 

@@ -1,6 +1,6 @@
 {
   "name": "qingstor-client-update-server",
-  "version": "1.2.1",
+  "version": "1.3.0",
   "description": "qingStorClient 版本更新服务：对外只暴露更新 API，管理端仅回环（SSH 隧道）可访问",
   "private": true,
   "main": "server.js",

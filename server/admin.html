@@ -122,6 +122,12 @@
   /* 存储标记：s3 用强调色，让「这一条到底在哪」一眼可辨 */
   .pill.s3 { color: var(--accent); border-color: rgba(109,139,255,.3); background: rgba(109,139,255,.1); }
   .pill.local { color: var(--text-3); }
+
+  /* 校验值状态：直传发布后 sha256 是后台补算的，必须一眼能看出「还没算好」 */
+  .cs { font-size: 12px; white-space: nowrap; }
+  .cs.ok { color: var(--ok); }
+  .cs.pending { color: var(--warn); }
+  .cs.failed { color: var(--danger); cursor: pointer; text-decoration: underline dotted; }
   .fname { max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .empty { padding: 26px; text-align: center; color: var(--text-3); font-size: 12.5px; }
   .row-actions { display: flex; gap: 6px; justify-content: flex-end; }
@@ -227,7 +233,7 @@
     <table>
       <thead>
         <tr>
-          <th>渠道</th><th>版本</th><th>平台</th><th>文件</th><th>存储</th>
+          <th>渠道</th><th>版本</th><th>平台</th><th>文件</th><th>存储</th><th>校验</th>
           <th class="num">大小</th><th class="num">下载</th><th>发布时间</th><th></th>
         </tr>
       </thead>
@@ -245,6 +251,8 @@
 
   var API = '/api/admin';
   var token = '';
+  // 进度文案要区分「转存到对象存储」和「写入本地磁盘」，取决于服务端驱动
+  var storageDriver = 'local';
 
   var $ = function (id) { return document.getElementById(id); };
 
@@ -319,6 +327,7 @@
     // 存储位置直接摆出来。1.2.0 那会儿配了 S3 却仍写本地盘，
     // 页面上没有任何地方能看出这一点 —— 这里就是那个坑的解药。
     var st = info.storage || { driver: 'local', root: info.releasesDir };
+    storageDriver = st.driver || 'local';
     var where = st.driver === 's3'
       ? '对象存储 · ' + (st.bucket || '') + '/' + (st.prefix || '') + ' · ' + (st.endpoint || '')
       : '本地磁盘 · ' + (st.root || info.releasesDir);
@@ -355,6 +364,19 @@
   };
 
   /* ---------------- 列表 ---------------- */
+  /**
+   * 校验值状态。直传发布的包服务端没碰过文件内容，sha256 要后台回读算，
+   * 这几十秒里列表必须能看出差别 —— 否则「已发布但校验值还没算」是个隐形状态。
+   */
+  function checksumCell(r) {
+    var s = r.checksumStatus || 'verified';
+    if (s === 'pending') return '<span class="cs pending">校验中…</span>';
+    if (s === 'failed') {
+      return '<span class="cs failed" data-act="recheck" title="点击重新计算">校验失败，重试</span>';
+    }
+    return '<span class="cs ok">已校验</span>';
+  }
+
   function load() {
     return api('/releases').then(function (j) {
       $('statTotal').textContent = j.total;
@@ -372,6 +394,7 @@
           '<td>' + esc(r.platform) + ' · ' + esc(r.arch) + '</td>' +
           '<td class="fname mono" title="' + esc(r.fileName) + '">' + esc(r.fileName) + '</td>' +
           '<td><span class="pill ' + esc(r.storage || 'local') + '">' + esc(r.storage || 'local') + '</span></td>' +
+          '<td>' + checksumCell(r) + '</td>' +
           '<td class="num">' + fmtBytes(r.size) + '</td>' +
           '<td class="num">' + r.downloads + '</td>' +
           '<td class="mono" style="color:var(--text-3)">' + fmtTime(r.publishedAt) + '</td>' +
@@ -379,6 +402,16 @@
           '<button class="mini" data-act="url">地址</button>' +
           '<button class="mini danger" data-act="del">删除</button>' +
           '</div></td>';
+
+        var recheckBtn = tr.querySelector('[data-act="recheck"]');
+        if (recheckBtn) {
+          recheckBtn.onclick = function () {
+            api('/releases/' + r.id + '/recheck', { method: 'POST' }).then(function () {
+              toast('已重新排队计算校验值');
+              return load();
+            }).catch(function (e) { toast(e.message, true); });
+          };
+        }
 
         tr.querySelector('[data-act="url"]').onclick = function () {
           var url = r.downloadUrl || (location.origin + '/api/releases/download/' + r.id);
@@ -467,33 +500,84 @@
 
   /* ---------------- 上传 ---------------- */
   /**
-   * 用 XHR 而不是 fetch：只有 XHR 能拿到 upload.onprogress，
-   * 上百 MB 的安装包不给进度条，用户会以为卡死而重复点。
-   * body 直接传 File 对象，浏览器会流式发送，不会把整个文件读进内存。
+   * 老路径：把整包 POST 给服务端，再由服务端转存到对象存储。
+   * local 驱动只能走这条；s3 模式下它是直传失败时的降级路径。
    */
-  $('uploadBtn').onclick = function () {
-    if (!picked) { toast('先选一个安装包', true); return; }
-    var version = $('fVersion').value.trim();
-    if (!/^v?\d+\.\d+\.\d+(-[0-9a-zA-Z.]+)?$/.test(version)) {
-      toast('版本号必须形如 2.0.1（可带 -beta.1 后缀）', true);
-      return;
-    }
-    var channel = $('fChannel').value.trim() || 'stable';
-    var platform = $('fPlatform').value;
-    var arch = $('fArch').value;
-    var notes = $('fNotes').value;
+  function uploadViaServer(picked, meta) {
+    var version = meta.version;
+    var channel = meta.channel;
+    var platform = meta.platform;
+    var arch = meta.arch;
+    var notes = meta.notes;
+
+    // 进度任务 id 由前端生成：服务端在收包时还不知道这是哪次上传，
+    // 只有请求里带过去才能把「接收中 / 转存中」两个阶段对应到同一个任务
+    var jobId = 'up' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 
     var qs = '?version=' + encodeURIComponent(version) +
       '&channel=' + encodeURIComponent(channel) +
       '&platform=' + encodeURIComponent(platform) +
       '&arch=' + encodeURIComponent(arch) +
       '&notes=' + encodeURIComponent(notes) +
+      '&job=' + encodeURIComponent(jobId) +
       // 文件名走 base64url：中文名塞进 URL 或 Header 都容易乱码
       '&name=' + encodeURIComponent(b64url(picked.name));
 
     var btn = $('uploadBtn');
     btn.disabled = true;
     setProgress(0, '准备上传…', '');
+
+    /**
+     * 两个阶段分开说清楚：
+     *   0-100% 是「浏览器 → 服务器」，XHR 自己就能算；
+     *   100% 之后是「服务器 → 对象存储」，客户端拿不到任何字节反馈，
+     *   只能轮询服务端内存里的任务状态。缺了这一段就是「100% 卡死」的观感。
+     */
+    var pollTimer = null;
+    var settled = false;
+
+    function stopPoll() {
+      if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+    }
+
+    function renderJob(j) {
+      if (!j || settled || j.phase === 'unknown') return;
+      var stageLabel = storageDriver === 's3' ? '转存到对象存储' : '写入本地磁盘';
+      if (j.phase === 'receiving') {
+        var rp = j.total ? Math.round(j.received / j.total * 100) : 0;
+        setProgress(rp, '服务端接收中 ' + rp + '%（' + fmtBytes(j.received) +
+          (j.total ? ' / ' + fmtBytes(j.total) : '') + '）', '');
+        return;
+      }
+      if (j.phase === 'transferring') {
+        var tp = j.size ? Math.round(j.transferred / j.size * 100) : 0;
+        setProgress(tp, stageLabel + ' ' + tp + '%（' + fmtBytes(j.transferred) +
+          ' / ' + fmtBytes(j.size) + (j.speed ? ' · ' + fmtBytes(j.speed) + '/s' : '') +
+          ' · 已用 ' + j.elapsed + 's）', '');
+        return;
+      }
+      if (j.phase === 'waiting') {
+        setProgress(100, '已发送 ' + fmtBytes(j.size) + '，等待' +
+          (storageDriver === 's3' ? '对象存储' : '磁盘') + '确认…（已用 ' + j.elapsed + 's）', '');
+        return;
+      }
+      if (j.phase === 'done') {
+        setProgress(100, (storageDriver === 's3' ? '对象存储已写入' : '本地磁盘已写入') + '，正在入库…', '');
+        return;
+      }
+      if (j.phase === 'failed') {
+        setProgress(0, '转存失败：' + (j.message || '未知错误'), 'err');
+      }
+    }
+
+    function startPoll() {
+      if (pollTimer || settled) return;
+      pollTimer = setInterval(function () {
+        api('/upload-progress?job=' + encodeURIComponent(jobId))
+          .then(function (j) { renderJob(j); })
+          .catch(function () { /* 轮询失败不打断上传，下一轮再试 */ });
+      }, 1000);
+    }
 
     var xhr = new XMLHttpRequest();
     xhr.open('PUT', API + '/releases' + qs);
@@ -503,10 +587,19 @@
     xhr.upload.onprogress = function (e) {
       if (!e.lengthComputable) return;
       var pct = Math.round(e.loaded / e.total * 100);
+      if (pct >= 100) {
+        // 字节已交给服务器，剩下的活服务端干，前端只能问
+        setProgress(100, '已上传，' +
+          (storageDriver === 's3' ? '正在转存到对象存储…' : '正在写入本地磁盘…'), '');
+        startPoll();
+        return;
+      }
       setProgress(pct, '上传中 ' + pct + '%（' + fmtBytes(e.loaded) + ' / ' + fmtBytes(e.total) + '）', '');
     };
 
     xhr.onload = function () {
+      settled = true;
+      stopPoll();
       btn.disabled = false;
       var j = null;
       try { j = JSON.parse(xhr.responseText); } catch (_) { /* 非 JSON，下面按状态码处理 */ }
@@ -533,15 +626,125 @@
     };
 
     xhr.onerror = function () {
+      settled = true;
+      stopPoll();
       btn.disabled = false;
       setProgress(0, '网络错误：连接被中断（可能是反代 body 上限或隧道断开）', 'err');
     };
     xhr.ontimeout = function () {
+      settled = true;
+      stopPoll();
       btn.disabled = false;
       setProgress(0, '上传超时', 'err');
     };
 
     xhr.send(picked);
+  }
+
+  /**
+   * 直传路径（仅 s3 驱动）：浏览器把文件直接 PUT 到预签名地址，服务器只签名和登记。
+   *
+   * 为什么值得绕这一下：服务器上行实测只有 0.4 MB/s，80MB 的包「上传到服务器
+   * + 服务器推给存储」两段加起来要好几分钟，而瓶颈全在服务器这一侧。
+   * 直传走的是发版人本机的上行，服务器完全不参与这段流量。
+   *
+   * 代价：服务端没碰过文件内容，sha256 只能事后回读补算，所以记录会先以
+   * 「校验中」出现，几十秒后变「已校验」。
+   */
+  function uploadDirect(picked, meta) {
+    var btn = $('uploadBtn');
+    btn.disabled = true;
+    setProgress(0, '正在申请直传地址…', '');
+
+    api('/uploads/prepare', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        version: meta.version,
+        channel: meta.channel,
+        platform: meta.platform,
+        arch: meta.arch,
+        fileName: picked.name,
+        size: picked.size,
+      }),
+    }).then(function (prep) {
+      setProgress(0, '准备直传…', '');
+      return new Promise(function (resolve, reject) {
+        var xhr = new XMLHttpRequest();
+        xhr.open('PUT', prep.putUrl);
+        // 刻意不设 Content-Type：预签名只签了 host，多余的头部在部分网关上会
+        // 直接 SignatureDoesNotMatch。浏览器默认的 application/octet-stream 够用。
+        xhr.upload.onprogress = function (e) {
+          if (!e.lengthComputable) return;
+          var pct = Math.round(e.loaded / e.total * 100);
+          // 用 Date.now() 而不是 e.timeStamp：后者是相对页面加载的时间基准，
+          // 和 startedAt 的 epoch 基准相减会算出天文数字
+          var sp = fmtSpeed(e.loaded, Date.now(), prep.startedAt);
+          setProgress(pct, '直传对象存储 ' + pct + '%（' + fmtBytes(e.loaded) +
+            ' / ' + fmtBytes(e.total) + (sp ? ' · ' + sp : '') + '）', '');
+        };
+        xhr.onload = function () {
+          if (xhr.status >= 200 && xhr.status < 300) return resolve(prep);
+          reject(new Error('对象存储拒绝了这次上传：HTTP ' + xhr.status +
+            (xhr.responseText ? ' ' + String(xhr.responseText).slice(0, 200) : '')));
+        };
+        xhr.onerror = function () {
+          reject(new Error('直传被中断：确认 bucket 的跨域规则允许当前来源发起 PUT'));
+        };
+        prep.startedAt = Date.now();
+        xhr.send(picked);
+      });
+    }).then(function (prep) {
+      setProgress(100, '直传完成，正在确认对象并登记…', '');
+      return api('/uploads/complete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jobId: prep.jobId, notes: meta.notes }),
+      });
+    }).then(function (r) {
+      setProgress(100, (r.replaced ? '已覆盖发布 ' : '已发布 ') +
+        r.release.channel + '/' + r.release.version + ' ' +
+        r.release.platform + '-' + r.release.arch +
+        '（校验值后台计算中，稍后刷新可见）', 'ok');
+      toast(r.replaced ? '已覆盖发布' : '发布成功');
+      setPicked(null);
+      $('fFile').value = '';
+      $('fVersion').value = '';
+      $('fNotes').value = '';
+      load();
+      // 回读算 sha256 需要几十秒，隔一会儿自动刷一次，让「校验中」翻成「已校验」
+      setTimeout(load, 25000);
+      btn.disabled = false;
+    }).catch(function (e) {
+      setProgress(0, '发布失败：' + e.message, 'err');
+      btn.disabled = false;
+    });
+  }
+
+  function fmtSpeed(loaded, nowTs, startTs) {
+    var sec = (nowTs - startTs) / 1000;
+    if (!(sec > 0.5) || !loaded) return '';
+    return fmtBytes(loaded / sec) + '/s';
+  }
+
+  /* ---------------- 上传入口 ---------------- */
+  $('uploadBtn').onclick = function () {
+    if (!picked) { toast('先选一个安装包', true); return; }
+    var version = $('fVersion').value.trim();
+    if (!/^v?\d+\.\d+\.\d+(-[0-9a-zA-Z.]+)?$/.test(version)) {
+      toast('版本号必须形如 2.0.1（可带 -beta.1 后缀）', true);
+      return;
+    }
+    var meta = {
+      version: version,
+      channel: $('fChannel').value.trim() || 'stable',
+      platform: $('fPlatform').value,
+      arch: $('fArch').value,
+      notes: $('fNotes').value,
+    };
+    // s3 驱动优先直传；local 没有对象存储可直传，只能走服务端中转
+    if (storageDriver === 's3') return uploadDirect(picked, meta);
+    return uploadViaServer(picked, meta);
   };
 
   function setProgress(pct, text, kind) {
