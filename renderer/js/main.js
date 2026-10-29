@@ -246,7 +246,7 @@ function renderTable() {
       <div class="empty-state">
         <div class="big">${fileIconHtml(searching ? 'other' : 'dir')}</div>
         <div>${searching ? `没有以「${esc(state.search)}」开头的对象` : '此目录为空'}</div>
-        <div style="font-size:11.5px">${searching ? '不区分大小写，只匹配名称开头（S3 前缀语义），换个开头的几个字试试' : '可拖拽文件/文件夹到此处上传，或使用上方按钮'}</div>
+        <div style="font-size:11.5px">${searching ? '区分大小写，只匹配名称开头（S3 前缀语义），换个开头的几个字试试' : '可拖拽文件/文件夹到此处上传，或使用上方按钮'}</div>
       </div>`;
   } else {
     let html = '';
@@ -384,14 +384,12 @@ function goUp() {
 
 /**
  * 搜索框 → 服务端前缀查询，三条规矩：
- * 1. 空闲 500ms 才发请求；走输入法时（composition 期间）一个字母都不发，
- *    否则每敲一下拼音都会拿半截词去查一次，列表跟着闪。
- * 2. 失焦时**取消**挂起的查询：用户点列表说明他要操作眼前这份列表，
- *    这时候突然重排是最坏的时机。
+ * 1. **主动触发**：只有回车、点「搜索」按钮才发请求。输入过程中一个请求都不发，
+ *    边打边查等于每敲一个字打一次 S3，列表还会跟着不停重排。
+ * 2. 输入法组词期间不碰 value（否则候选状态被顶掉），上屏后再刷新按钮态。
  * 3. 搜索期间的重新加载不盖遮罩（silent），只在搜索框上转个小圈。
+ * 清空搜索（✕ / Esc）回到当前目录的完整清单，这一步保持「点了就生效」。
  */
-const SEARCH_DELAY = 500;
-let searchTimer = null;
 let composing = false;
 
 function setSearchBusy(busy) {
@@ -403,29 +401,28 @@ function syncSearchInput() {
   const input = $('searchInput');
   // 组词中回写 value 会把输入法的候选状态顶掉
   if (!composing && input.value !== state.search) input.value = state.search;
-  $('btnSearchClear').classList.toggle('hidden', !state.search);
+  refreshSearchControls();
 }
 
-function cancelScheduledSearch() {
-  if (searchTimer) {
-    clearTimeout(searchTimer);
-    searchTimer = null;
-  }
-}
-
-function scheduleSearch(value) {
-  cancelScheduledSearch();
-  const text = String(value == null ? '' : value);
-  $('btnSearchClear').classList.toggle('hidden', !text);
-  searchTimer = setTimeout(() => {
-    searchTimer = null;
-    applySearch(text);
-  }, SEARCH_DELAY);
+/**
+ * 搜索控件态：清空按钮跟随输入框有无内容，搜索按钮在「输入框内容 ≠ 已生效关键词」时
+ * 高亮并可用 —— 也就是「有改动还没搜」。
+ */
+function refreshSearchControls() {
+  const input = $('searchInput');
+  const text = String(input.value || '');
+  const go = $('btnSearchGo');
+  $('btnSearchClear').classList.toggle('hidden', !text && !state.search);
+  go.disabled = !text.trim();
+  go.classList.toggle('dirty', text.trim() !== state.search);
 }
 
 function applySearch(value) {
   const next = String(value || '').trim();
-  if (next === state.search) return;
+  if (next === state.search) {
+    refreshSearchControls();
+    return;
+  }
   state.search = next;
   syncSearchInput();
   if (!state.configured) return; // 还没连上，没有列表可搜
@@ -434,11 +431,11 @@ function applySearch(value) {
 }
 
 function clearSearch() {
-  if (!state.search && !$('searchInput').value) return;
-  cancelScheduledSearch();
-  $('searchInput').value = '';
-  $('btnSearchClear').classList.add('hidden');
+  const input = $('searchInput');
+  if (!state.search && !input.value) return;
+  input.value = '';
   applySearch('');
+  syncSearchInput();
 }
 
 /* ================= 操作：上传/下载/删除/新建 ================= */
@@ -658,36 +655,29 @@ function bindEvents() {
   $('btnPrevPage').addEventListener('click', goPrevPage);
   $('btnNextPage').addEventListener('click', goNextPage);
 
-  // 搜索：空闲 500ms 生效，输入法组词期间不触发，回车立即生效，Esc 清空，失焦取消
+  // 搜索：主动触发 —— 回车 / 点「搜索」按钮才查；Esc 清空回列表
   const input = $('searchInput');
-  input.addEventListener('compositionstart', () => {
-    composing = true;
-    cancelScheduledSearch();
-  });
+  input.addEventListener('compositionstart', () => { composing = true; });
   input.addEventListener('compositionend', () => {
     composing = false;
-    scheduleSearch(input.value);
+    refreshSearchControls();
   });
   input.addEventListener('input', () => {
     if (composing) return; // 拼音还没上屏，这时候的值是半成品
-    scheduleSearch(input.value);
-  });
-  input.addEventListener('blur', () => {
-    // 失焦不补发：否则「打完字顺手点文件」会变成一次意外重排
-    cancelScheduledSearch();
-    setSearchBusy(false);
+    refreshSearchControls();
   });
   input.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') {
       e.preventDefault();
-      cancelScheduledSearch();
       applySearch(input.value);
     } else if (e.key === 'Escape') {
       e.preventDefault();
       clearSearch();
     }
   });
+  $('btnSearchGo').addEventListener('click', () => applySearch(input.value));
   $('btnSearchClear').addEventListener('click', () => { clearSearch(); input.focus(); });
+  refreshSearchControls();
 
   // 列头排序（仅当前页）
   document.querySelectorAll('.table-head .sortable').forEach((el) => {

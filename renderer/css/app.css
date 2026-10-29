@@ -288,7 +288,7 @@ body.resizing { cursor: col-resize; user-select: none; }
   align-items: center;
   gap: 5px;
   height: 30px;
-  width: 210px;
+  width: 250px;
   padding: 0 8px;
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
@@ -322,6 +322,25 @@ body.resizing { cursor: col-resize; user-select: none; }
   padding: 0;
 }
 .tb-search-clear:hover { color: var(--text); background: var(--hover); }
+/* 搜索是主动触发的：按钮常规为弱化态，输入框与已生效关键词不一致时染成强调色 */
+.tb-search-go {
+  flex: none;
+  height: 21px;
+  padding: 0 8px;
+  border: none;
+  border-radius: 4px;
+  background: var(--hover);
+  color: var(--faint);
+  font-size: 11.5px;
+  font-family: var(--font);
+  line-height: 21px;
+  cursor: pointer;
+  transition: background .12s, color .12s;
+}
+.tb-search-go:hover:not(:disabled) { color: var(--text); background: var(--border2); }
+.tb-search-go.dirty { background: var(--accent); color: #fff; }
+.tb-search-go.dirty:hover:not(:disabled) { background: var(--accent); color: #fff; filter: brightness(1.08); }
+.tb-search-go:disabled { opacity: .4; cursor: default; }
 /* 搜索请求进行中：图标转圈，代替把整个列表盖上一层遮罩 */
 .tb-search.searching .tb-search-ic {
   color: var(--accent);

@@ -132,6 +132,28 @@ const SMOKE_SCRIPT = `(async () => {
   sm.setSearch('');
   add('清空搜索恢复分页条', !$('pager').classList.contains('search-mode'));
 
+  // 搜索主动触发：输入不查，回车 / 点按钮才查，Esc 清空回原清单
+  const inp = $('searchInput');
+  const go = $('btnSearchGo');
+  add('搜索按钮存在', !!go && !!$('btnSearchClear'));
+  const realConfigured = sm.state.configured;
+  sm.state.configured = false; // 只断触发链路，不真的去打 S3
+  sm.setSearch('');
+  inp.value = '报告';
+  inp.dispatchEvent(new Event('input'));
+  add('输入不自动触发搜索', sm.state.search === '' && go.classList.contains('dirty'), 'search=' + JSON.stringify(sm.state.search));
+  inp.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+  add('回车触发搜索', sm.state.search === '报告', 'search=' + sm.state.search);
+  add('搜索后按钮回常态', !go.classList.contains('dirty'));
+  inp.value = '预算';
+  inp.dispatchEvent(new Event('input'));
+  go.click();
+  add('点按钮触发搜索', sm.state.search === '预算', 'search=' + sm.state.search);
+  inp.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+  add('Esc 清空回原清单', sm.state.search === '' && inp.value === '', 'value=' + inp.value);
+  sm.state.configured = realConfigured;
+  sm.setSearch('');
+
   sm.inject([]);
   add('空目录占位', !!document.querySelector('#tableBody .empty-state'));
 
@@ -167,19 +189,27 @@ async function runSmokeChecks() {
   }
   if (!Array.isArray(checks)) checks = [];
 
-  // 主进程侧：S3 的 Prefix 是字节精确匹配，大小写只能靠多变体覆盖，验证变体生成
-  const kwVariants = typeof s3.caseVariants === 'function' ? s3.caseVariants('zj') : [];
-  checks.push({
-    name: '搜索词大小写变体',
-    ok: ['zj', 'ZJ', 'Zj'].every((v) => kwVariants.indexOf(v) >= 0),
-    detail: kwVariants.join(','),
-  });
-  const cnVariants = typeof s3.caseVariants === 'function' ? s3.caseVariants('报告') : [];
-  checks.push({
-    name: '中文关键词不放大请求数',
-    ok: cnVariants.length === 1,
-    detail: cnVariants.join(','),
-  });
+  // 主进程侧：搜索严格走 S3 原生 Prefix（字节精确），单次请求，不再造大小写变体
+  {
+    const calls = [];
+    const fake = {
+      send: async (cmd) => {
+        calls.push(cmd.input || {});
+        return { CommonPrefixes: [], Contents: [], IsTruncated: false };
+      },
+    };
+    try {
+      await s3.searchDir(fake, { bucket: 'b', prefix: '' }, '', 'zj', { maxKeys: 200 });
+    } catch (e) {
+      smokeErrors.push('searchDir 调用失败：' + (e.message || e));
+    }
+    const first = calls[0] || {};
+    checks.push({
+      name: '搜索单次请求且前缀原样下发',
+      ok: calls.length === 1 && first.Prefix === 'zj',
+      detail: calls.length + ' 次，Prefix=' + (first.Prefix || ''),
+    });
+  }
 
   // 可选：把断言后的界面截下来，人工核对图标 / 分页条的视觉效果
   if (process.env.QINGSTOR_SMOKE_SHOT === '1') {
@@ -409,9 +439,9 @@ function registerIpc() {
     const cfg = requireConfig();
     const client = s3.createClient(cfg);
     const o = opts || {};
-    // 带搜索词走大小写不敏感的多变体前缀查询；普通浏览还是原来的游标分页
+    // 带搜索词走单次前缀查询（S3 原生语义，大小写敏感）；普通浏览还是游标分页
     if (o.search) {
-      return s3.searchDir(client, cfg, String(dir || ''), o.search, { perVariant: o.maxKeys });
+      return s3.searchDir(client, cfg, String(dir || ''), o.search, { maxKeys: o.maxKeys });
     }
     return s3.listDir(client, cfg, String(dir || ''), o);
   });
