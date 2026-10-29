@@ -55,7 +55,7 @@ function hideMask() {
 }
 
 function resetPaging() {
-  state.page = { index: 0, tokens: [undefined], nextToken: null, hasMore: false };
+  state.page = { index: 0, tokens: [undefined], nextToken: null, hasMore: false, truncated: false };
 }
 
 function pageCacheKey(index) {
@@ -109,6 +109,8 @@ async function loadPage(index, { silent = false } = {}) {
     state.page.nextToken = res.nextToken || null;
     // IsTruncated 但没有 token 属于服务端异常，别让「下一页」变成点了没反应的死按钮
     state.page.hasMore = !!res.truncated && !!res.nextToken;
+    // 搜索模式不分页，但被截断时要说一声，否则用户以为只有这么多
+    state.page.truncated = !!res.truncated;
     if (res.nextToken) state.page.tokens[index + 1] = res.nextToken;
 
     state.selection.clear();
@@ -130,6 +132,7 @@ async function loadPage(index, { silent = false } = {}) {
     if (seq === state.loadSeq) {
       state.loading = false;
       hideMask();
+      setSearchBusy(false);
     }
   }
 }
@@ -243,7 +246,7 @@ function renderTable() {
       <div class="empty-state">
         <div class="big">${fileIconHtml(searching ? 'other' : 'dir')}</div>
         <div>${searching ? `没有以「${esc(state.search)}」开头的对象` : '此目录为空'}</div>
-        <div style="font-size:11.5px">${searching ? 'S3 只支持前缀匹配，换个开头的几个字试试' : '可拖拽文件/文件夹到此处上传，或使用上方按钮'}</div>
+        <div style="font-size:11.5px">${searching ? '不区分大小写，只匹配名称开头（S3 前缀语义），换个开头的几个字试试' : '可拖拽文件/文件夹到此处上传，或使用上方按钮'}</div>
       </div>`;
   } else {
     let html = '';
@@ -286,6 +289,17 @@ function updateCheckAll() {
 
 function renderPager() {
   const pager = $('pager');
+  if (state.search) {
+    // 搜索结果不分页：游标只能一路往后翻，而搜索该做的是加长前缀收窄范围
+    pager.classList.remove('hidden');
+    pager.classList.add('search-mode');
+    const n = state.entries.length;
+    $('pageLabel').textContent = n === 0
+      ? '无匹配'
+      : `匹配 ${n} 项${state.page.truncated ? '（已截断，加长前缀收窄）' : ''}`;
+    return;
+  }
+  pager.classList.remove('search-mode');
   const show = state.page.index > 0 || state.page.hasMore;
   pager.classList.toggle('hidden', !show);
   $('pageLabel').textContent = `第 ${state.page.index + 1} 页`;
@@ -368,12 +382,45 @@ function goUp() {
 
 /* ================= 搜索 ================= */
 
+/**
+ * 搜索框 → 服务端前缀查询，三条规矩：
+ * 1. 空闲 500ms 才发请求；走输入法时（composition 期间）一个字母都不发，
+ *    否则每敲一下拼音都会拿半截词去查一次，列表跟着闪。
+ * 2. 失焦时**取消**挂起的查询：用户点列表说明他要操作眼前这份列表，
+ *    这时候突然重排是最坏的时机。
+ * 3. 搜索期间的重新加载不盖遮罩（silent），只在搜索框上转个小圈。
+ */
+const SEARCH_DELAY = 500;
 let searchTimer = null;
+let composing = false;
+
+function setSearchBusy(busy) {
+  const box = $('searchInput').closest('.tb-search');
+  if (box) box.classList.toggle('searching', !!busy);
+}
 
 function syncSearchInput() {
   const input = $('searchInput');
-  if (input.value !== state.search) input.value = state.search;
+  // 组词中回写 value 会把输入法的候选状态顶掉
+  if (!composing && input.value !== state.search) input.value = state.search;
   $('btnSearchClear').classList.toggle('hidden', !state.search);
+}
+
+function cancelScheduledSearch() {
+  if (searchTimer) {
+    clearTimeout(searchTimer);
+    searchTimer = null;
+  }
+}
+
+function scheduleSearch(value) {
+  cancelScheduledSearch();
+  const text = String(value == null ? '' : value);
+  $('btnSearchClear').classList.toggle('hidden', !text);
+  searchTimer = setTimeout(() => {
+    searchTimer = null;
+    applySearch(text);
+  }, SEARCH_DELAY);
 }
 
 function applySearch(value) {
@@ -381,11 +428,14 @@ function applySearch(value) {
   if (next === state.search) return;
   state.search = next;
   syncSearchInput();
-  reloadCurrent();
+  if (!state.configured) return; // 还没连上，没有列表可搜
+  setSearchBusy(true);
+  reloadCurrent({ silent: true });
 }
 
 function clearSearch() {
   if (!state.search && !$('searchInput').value) return;
+  cancelScheduledSearch();
   $('searchInput').value = '';
   $('btnSearchClear').classList.add('hidden');
   applySearch('');
@@ -608,17 +658,29 @@ function bindEvents() {
   $('btnPrevPage').addEventListener('click', goPrevPage);
   $('btnNextPage').addEventListener('click', goNextPage);
 
-  // 搜索：输入 300ms 防抖，回车立即生效，Esc 清空
+  // 搜索：空闲 500ms 生效，输入法组词期间不触发，回车立即生效，Esc 清空，失焦取消
   const input = $('searchInput');
+  input.addEventListener('compositionstart', () => {
+    composing = true;
+    cancelScheduledSearch();
+  });
+  input.addEventListener('compositionend', () => {
+    composing = false;
+    scheduleSearch(input.value);
+  });
   input.addEventListener('input', () => {
-    clearTimeout(searchTimer);
-    $('btnSearchClear').classList.toggle('hidden', !input.value);
-    searchTimer = setTimeout(() => applySearch(input.value), 300);
+    if (composing) return; // 拼音还没上屏，这时候的值是半成品
+    scheduleSearch(input.value);
+  });
+  input.addEventListener('blur', () => {
+    // 失焦不补发：否则「打完字顺手点文件」会变成一次意外重排
+    cancelScheduledSearch();
+    setSearchBusy(false);
   });
   input.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') {
       e.preventDefault();
-      clearTimeout(searchTimer);
+      cancelScheduledSearch();
       applySearch(input.value);
     } else if (e.key === 'Escape') {
       e.preventDefault();
@@ -1031,6 +1093,7 @@ if (window.bridge.env && window.bridge.env.smoke) {
     setSearch(v) {
       state.search = String(v || '');
       syncSearchInput();
+      renderPager();
     },
     /**
      * 冒烟用：把「发现新版本」弹窗按真实参数打开，用来核对文案与按钮流转。

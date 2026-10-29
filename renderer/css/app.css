@@ -222,13 +222,17 @@ body.resizing { cursor: col-resize; user-select: none; }
 .pager { display: flex; align-items: center; gap: 6px; flex: none; }
 .pager .mini-btn { height: 22px; padding: 0 8px; }
 .pager .mini-btn:disabled { opacity: .4; cursor: not-allowed; }
+/* 搜索模式：结果不分页，翻页按钮整体收起，只留一行匹配数 */
+.pager.search-mode .mini-btn { display: none; }
 .page-label {
   font-size: 11.5px;
   color: var(--faint);
   font-variant-numeric: tabular-nums;
   min-width: 48px;
   text-align: center;
+  white-space: nowrap;
 }
+.pager.search-mode .page-label { text-align: right; color: var(--dim); }
 
 .crumb {
   color: var(--dim);
@@ -318,6 +322,11 @@ body.resizing { cursor: col-resize; user-select: none; }
   padding: 0;
 }
 .tb-search-clear:hover { color: var(--text); background: var(--hover); }
+/* 搜索请求进行中：图标转圈，代替把整个列表盖上一层遮罩 */
+.tb-search.searching .tb-search-ic {
+  color: var(--accent);
+  animation: spin .9s linear infinite;
+}
 
 /* ---------------- 文件区 ---------------- */
 #fileArea {

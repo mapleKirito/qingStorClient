@@ -127,7 +127,10 @@ const SMOKE_SCRIPT = `(async () => {
 
   sm.setSearch('报告');
   add('搜索词回填输入框', $('searchInput').value === '报告', $('searchInput').value);
+  add('搜索模式收起翻页按钮', $('pager').classList.contains('search-mode') && !$('pager').classList.contains('hidden'));
+  add('搜索结果显示匹配数', /^匹配 \\d+ 项/.test($('pageLabel').textContent), $('pageLabel').textContent);
   sm.setSearch('');
+  add('清空搜索恢复分页条', !$('pager').classList.contains('search-mode'));
 
   sm.inject([]);
   add('空目录占位', !!document.querySelector('#tableBody .empty-state'));
@@ -163,6 +166,20 @@ async function runSmokeChecks() {
     smokeErrors.push('执行冒烟脚本失败：' + (e.message || e));
   }
   if (!Array.isArray(checks)) checks = [];
+
+  // 主进程侧：S3 的 Prefix 是字节精确匹配，大小写只能靠多变体覆盖，验证变体生成
+  const kwVariants = typeof s3.caseVariants === 'function' ? s3.caseVariants('zj') : [];
+  checks.push({
+    name: '搜索词大小写变体',
+    ok: ['zj', 'ZJ', 'Zj'].every((v) => kwVariants.indexOf(v) >= 0),
+    detail: kwVariants.join(','),
+  });
+  const cnVariants = typeof s3.caseVariants === 'function' ? s3.caseVariants('报告') : [];
+  checks.push({
+    name: '中文关键词不放大请求数',
+    ok: cnVariants.length === 1,
+    detail: cnVariants.join(','),
+  });
 
   // 可选：把断言后的界面截下来，人工核对图标 / 分页条的视觉效果
   if (process.env.QINGSTOR_SMOKE_SHOT === '1') {
@@ -391,7 +408,12 @@ function registerIpc() {
   ipcMain.handle('s3:list', async (_e, dir, opts) => {
     const cfg = requireConfig();
     const client = s3.createClient(cfg);
-    return s3.listDir(client, cfg, String(dir || ''), opts || {});
+    const o = opts || {};
+    // 带搜索词走大小写不敏感的多变体前缀查询；普通浏览还是原来的游标分页
+    if (o.search) {
+      return s3.searchDir(client, cfg, String(dir || ''), o.search, { perVariant: o.maxKeys });
+    }
+    return s3.listDir(client, cfg, String(dir || ''), o);
   });
 
   // 目录树只拉子目录，不拉文件

@@ -121,6 +121,98 @@ async function listDir(client, cfg, dir, { token, maxKeys = 200, search = '' } =
 }
 
 /**
+ * 前缀的大小写变体（最多 4 个，彼此去重）。
+ *
+ * S3 的 Prefix 是**字节精确**匹配，没有 case-insensitive 选项，所以「zj 命中 ZJ」只能
+ * 靠多问几次：原样、全小写、全大写、首字母大写。中文关键词的四个变体全部相同，去重后
+ * 只剩 1 个请求，不为非 ASCII 场景付代价。
+ * 缺的只是 zJ 这种怪写法（没人会这么敲），换来的是常见的大小写混排都能命中。
+ */
+function caseVariants(keyword) {
+  const kw = String(keyword || '');
+  const list = [
+    kw,
+    kw.toLowerCase(),
+    kw.toUpperCase(),
+    kw.replace(/^([a-z])/, (m) => m.toUpperCase()),
+  ];
+  const seen = new Set();
+  const out = [];
+  for (const v of list) {
+    if (!v || seen.has(v)) continue;
+    seen.add(v);
+    out.push(v);
+    if (out.length >= 4) break;
+  }
+  return out;
+}
+
+/**
+ * 大小写不敏感的前缀搜索。
+ *
+ * 与 listDir 的区别：
+ * - 不分页。一次最多取「变体数 × perVariant」条，搜索本来就该靠加长前缀收窄，
+ *   而不是翻页；返回的 nextToken 恒为空，由渲染层把分页条收起来。
+ * - 结果按 name 做一次 `toLowerCase().startsWith()` 复核，保证不会因为某个变体
+ *   恰好命中而混进大小写不符的项。
+ */
+async function searchDir(client, cfg, dir, keyword, { perVariant = 200 } = {}) {
+  const base = names.dirKey(cfg.prefix);
+  const dirPrefix = base + names.dirKey(dir);
+  const kw = String(keyword || '').trim();
+  const limit = Math.min(1000, Math.max(1, Math.round(Number(perVariant) || 200)));
+  const lowerKw = kw.toLowerCase();
+  // 关键词里带 / 时是「跨层前缀」，服务端已经把范围收窄到那一层，不能再拿最后一段去比
+  const verify = !kw.includes('/');
+  const variants = caseVariants(kw);
+
+  const responses = await Promise.all(variants.map((v) => client.send(new ListObjectsV2Command({
+    Bucket: cfg.bucket,
+    Prefix: dirPrefix + v,
+    Delimiter: '/',
+    MaxKeys: limit,
+  }))));
+
+  const dirs = new Map();
+  const files = new Map();
+  let truncated = false;
+
+  for (const res of responses) {
+    if (res.IsTruncated) truncated = true;
+    for (const cp of res.CommonPrefixes || []) {
+      const rel = names.stripPrefix(cp.Prefix, cfg.prefix).replace(/\/+$/, '');
+      const name = names.basename(rel);
+      if (!name) continue;
+      if (verify && !name.toLowerCase().startsWith(lowerKw)) continue;
+      if (!dirs.has(rel)) dirs.set(rel, { name, key: rel, dir: true });
+    }
+    for (const obj of res.Contents || []) {
+      const rel = names.stripPrefix(obj.Key, cfg.prefix);
+      if (rel === '' || rel.endsWith('/')) continue;
+      const name = names.basename(rel);
+      if (!name) continue;
+      if (verify && !name.toLowerCase().startsWith(lowerKw)) continue;
+      if (files.has(rel)) continue;
+      files.set(rel, {
+        name,
+        key: rel,
+        size: obj.Size || 0,
+        mtime: obj.LastModified ? obj.LastModified.toISOString() : '',
+      });
+    }
+  }
+
+  const sortName = (a, b) => a.name.localeCompare(b.name, 'zh-Hans-CN');
+  return {
+    dirs: [...dirs.values()].sort(sortName),
+    files: [...files.values()].sort(sortName),
+    truncated,
+    nextToken: '',
+    variants,
+  };
+}
+
+/**
  * 只列举子目录（供左侧目录树使用）。
  * 不返回文件 —— 树只需要一层目录名，把文件也拉回来在万级目录下是纯浪费。
  * 单层目录超过 maxKeys 时置 truncated，由调用方决定怎么提示。
@@ -250,6 +342,8 @@ module.exports = {
   createClient,
   testConnection,
   listDir,
+  searchDir,
+  caseVariants,
   listDirs,
   listAll,
   deleteKeys,
