@@ -2,6 +2,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
+const crypto = require('node:crypto');
 const { normalizeKey } = require('./index');
 
 /**
@@ -48,6 +49,34 @@ module.exports = function createLocal(opts) {
     /** 本地模式没有「临时地址」这个概念，由调用方走流式返回 */
     signedUrl() {
       return null;
+    },
+
+    /** 本地模式不能浏览器直传，前端据此回落到「先传到服务器」的老路径 */
+    signedPutUrl() {
+      return null;
+    },
+
+    async stat(relKey) {
+      try {
+        return { size: fs.statSync(absFor(relKey)).size };
+      } catch {
+        return null;
+      }
+    },
+
+    /**
+     * 本地文件回读校验。中转上传时 sha256 是边收边算的，用不到这个；
+     * 它存在是为了让两个驱动在「重新计算校验值」这件事上接口一致。
+     */
+    async sha256Of(relKey) {
+      const abs = absFor(relKey);
+      const hash = crypto.createHash('sha256');
+      let size = 0;
+      for await (const chunk of fs.createReadStream(abs)) {
+        size += chunk.length;
+        hash.update(chunk);
+      }
+      return { sha256: hash.digest('hex'), size };
     },
 
     async remove(relKey) {

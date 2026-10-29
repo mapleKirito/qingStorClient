@@ -18,7 +18,7 @@ node server.js
 ```
 
 ```
-  qingStorClient 更新服务 v1.2.1
+  qingStorClient 更新服务 v1.3.0
   ------------------------------------------------------------------
   更新 API            http://127.0.0.1:8787/api/releases/latest
   ------------------------------------------------------------------
@@ -66,7 +66,7 @@ node server.js
 ### 1. `GET /`
 
 ```json
-{ "ok": true, "service": "qingstor-client-update", "name": "qingStorClient 更新服务", "version": "1.2.1", "scope": "仅分发客户端安装包，不提供账号、配置同步与第三方代理", "serverTime": 1793167849698 }
+{ "ok": true, "service": "qingstor-client-update", "name": "qingStorClient 更新服务", "version": "1.3.0", "scope": "仅分发客户端安装包，不提供账号、配置同步与第三方代理", "serverTime": 1793167849698 }
 ```
 
 服务自述。浏览器直接敲域名就能确认服务活着、版本多少，不必先记住 `/api/health`。
@@ -76,7 +76,7 @@ node server.js
 ### 2. `GET /api/health`
 
 ```json
-{ "ok": true, "service": "qingstor-client-update", "version": "1.2.1", "releases": 12, "storage": "local", "uptime": 3600, "checkedAt": 1793097689079 }
+{ "ok": true, "service": "qingstor-client-update", "version": "1.3.0", "releases": 12, "storage": "local", "uptime": 3600, "checkedAt": 1793097689079 }
 ```
 
 给 nginx / 监控探活用。带发布数量与运行时长，用来判断库是否读得动；不含平台、架构、版本号等任何可推断业务的信息。
@@ -169,7 +169,11 @@ Range 由客户端跟随 302 后直接对对象存储发起（实测支持，返
 | `GET /admin` | 管理页（不需要令牌，页面里再输） |
 | `GET /api/admin/whoami` | 服务端配置自检：版本、目录、上限、令牌来源 |
 | `GET /api/admin/releases` | 列表 + 总数 + 总占用 + 渠道清单 |
-| `PUT /api/admin/releases?version=&platform=&arch=&channel=&notes=&name=` | 发布，body 是安装包原始字节 |
+| `PUT /api/admin/releases?version=&platform=&arch=&channel=&notes=&name=&job=` | 发布，body 是安装包原始字节 |
+| `GET /api/admin/upload-progress?job=` | 查询一次上传的进度（接收中 / 转存中 / 等待确认 / 完成 / 失败） |
+| `POST /api/admin/uploads/prepare` | 直传第一步：校验元信息，返回预签名 PUT 地址（仅 s3 驱动） |
+| `POST /api/admin/uploads/complete` | 直传第三步：核对对象存在与大小，写库并排队补算校验值 |
+| `POST /api/admin/releases/:id/recheck` | 重新回读计算某条记录的 sha256（回读失败时的唯一出路） |
 | `DELETE /api/admin/releases/:id` | 删除记录并删掉磁盘文件 |
 | `GET /api/admin/audit` | 最近的发布/删除/被拒记录 |
 
@@ -179,7 +183,30 @@ Range 由客户端跟随 302 后直接对对象存储发起（实测支持，返
 - **文件名走 `name` 参数、base64url 编码。** 中文名直接塞 URL 或 Header 都会乱码。服务端会做往返校验，传明文也能正确识别。
 - **同一「渠道+版本+平台+架构」重复发布＝覆盖**，旧文件同时删除。所以 dev 渠道可以无脑重发，不会堆出一串同版本号的垃圾记录。
 - **超限不 destroy 请求。** 超过 `RELEASE_MAX_MB` 后继续把 body 读完再回 413，直接 destroy 会让客户端只看到"连接被重置"，拿不到状态码。
+- **上传有两个阶段，进度要分开看。** 「浏览器 → 服务器」由 XHR 的 `upload.onprogress` 覆盖；到 100% 之后是「服务器 → 对象存储」的转存，客户端拿不到任何字节反馈，所以请求里带一个 `job` id，再轮询 `/api/admin/upload-progress` 取服务端内存里的任务状态。不传 `job` 也能正常发布，只是前端只剩"卡在 100%"这一个观感。任务只存内存（不落库），完成或失败后保留 2 分钟。
 - 没有提供"改说明"、"改版本号"的接口：要改就是重发，覆盖语义已经覆盖了这个需求。
+
+### 上传走哪条路：直传还是中转
+
+`STORAGE_DRIVER=s3` 时管理页走**浏览器直传**，local 时走**服务端中转**。两条路的差别只在字节怎么到存储，库里记录的形态完全一致。
+
+| | 直传（s3） | 中转（local / 降级） |
+| --- | --- | --- |
+| 数据路径 | 浏览器 → 对象存储 | 浏览器 → 服务器 → 存储 |
+| 服务器带宽 | 只走几百字节的签名与登记 | 上传占下行、转存占上行 |
+| 速度上限 | 发版人本机的上行 | 服务器的上行（常见 3-5 Mbps，最慢的一环） |
+| sha256 | 后台回读补算，先 `pending` 后 `verified` | 边收边算，当场 `verified` |
+
+直传是为了绕开服务器上行：实测 5 Mbps 的 ECS 上行只有 0.4 MB/s，80MB 的包光"服务器 → 存储"这一段就要三分半，而这一段在直传里根本不存在。
+
+三个必须知道的前提：
+
+1. **bucket 要配 CORS**，允许管理页来源发起 `PUT`。没配的话浏览器连预检都过不去，报错是 `直传被中断`。
+2. **管理页的 CSP 会自动放行对象存储的公网端点**（`connect-src` 里追加 `storage.publicEndpoint` 的 origin）。换 bucket 或换域名不用改 CSP，但要确认 `S3_PUBLIC_ENDPOINT` 或 `S3_ENDPOINT` 是浏览器能访问的那个。
+3. **校验值是异步补的**。`complete` 一返回记录就可见，此时 `checksumStatus=pending`、`sha256` 为空；后台串行回读算完后写回 `verified`。回读失败重试 3 次后置 `failed`，管理端该格会变成可点的「校验失败，重试」。
+   - `pending` 期间下载的客户端不做哈希校验，只比长度（客户端逻辑：`if (expected && ...)`）。刚发完包就有人下载的窗口期，校验强度是降级的。
+
+服务端上行如果本来就不是瓶颈（比如内网千兆、专线），直传的收益主要体现在"发版人本机比服务器快"上；如果两条路都不慢，那绕不绕这一下都无所谓。
 
 ---
 
@@ -290,15 +317,15 @@ docker login registry.cn-hangzhou.aliyuncs.com
 
 | 情形 | 打的 tag |
 | --- | --- |
-| HEAD 上有 `server-v1.2.1` 标签，且与 `package.json` 一致 | `1.2.1` + `latest` |
+| HEAD 上有 `server-v1.3.0` 标签，且与 `package.json` 一致 | `1.3.0` + `latest` |
 | 没有服务端标签（客户端 `v*` 标签不算） | 用 `package.json` 的 `version`，规则同上 |
 | 版本含 `-`（如 `2.1.0-beta.1`） | 只打 `2.1.0-beta.1`，**不动 `latest`** |
 | 加 `--floating` | 正式版额外打 `1.2` 与 `1` |
 | 加 `--tag dev` | 额外再打一个 `dev` |
 
-服务端标签必须带 `server-v` 前缀，例如 `git tag server-v1.2.1`。**不要用裸 `v1.2.1`** —— 客户端发版也打 `v*`，两套版本号（客户端 0.0.x-dev / 服务端 1.2.1）共用同一个标签空间，混用会导致脚本读到客户端的版本号再与服务端 `package.json` 比对，直接报错退出。
+服务端标签必须带 `server-v` 前缀，例如 `git tag server-v1.3.0`。**不要用裸 `v1.3.0`** —— 客户端发版也打 `v*`，两套版本号（客户端 0.0.x-dev / 服务端 1.3.0）共用同一个标签空间，混用会导致脚本读到客户端的版本号再与服务端 `package.json` 比对，直接报错退出。
 
-服务端标签与 `package.json` 不一致时脚本**直接报错退出**，避免出现「标签写着 1.3.0、镜像却是 1.2.1」。
+服务端标签与 `package.json` 不一致时脚本**直接报错退出**，避免出现「标签写着 1.3.0、镜像却是 1.3.0」。
 
 其它常用选项：
 

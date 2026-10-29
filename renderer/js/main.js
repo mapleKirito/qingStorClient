@@ -1,9 +1,19 @@
 import {
   fmtBytes, fmtTime, esc, toast, confirmDialog, promptDialog, configDialog, showContextMenu,
-  updateAvailableDialog, updateProgressDialog,
+  updateAvailableDialog,
 } from './util.js';
+import { createTree } from './tree.js';
+import { categoryOf, fileIconHtml } from './fileicon.js';
 
 const $ = (id) => document.getElementById(id);
+
+/** 目录树实例，配置就绪后才创建（未连接时无事可列） */
+let tree = null;
+
+/** 单页条数：S3 无偏移量，只能游标前进；200 是「一屏多一点」的折中 */
+const PAGE_SIZE = 200;
+/** 页缓存上限（LRU）：20 页约 4000 条，内存约 2MB，够来回翻 */
+const PAGE_CACHE_MAX = 20;
 
 const state = {
   version: '',
@@ -11,45 +21,179 @@ const state = {
   updateBase: '',
   channel: 'stable',   // 当前更新渠道：stable / dev
   availableVersion: '',
+  mutedVersion: '',    // 用户勾过「不再提醒此版本」的版本号
+  pendingUpdate: null, // 未完成连接配置时先暂存，配置完再弹
+  promptingUpdate: false,
   checkingUpdate: false,
   configured: false,
   currentDir: '', // 相对前缀的目录 key
-  entries: [],    // [{key, name, isDir, size, mtime}]
+  search: '',     // 前缀搜索词，空串为浏览模式
+  sort: { by: 'name', dir: 'asc' },
+  entries: [],    // 当前页 [{key, name, isDir, size, mtime}]
+  indexByKey: new Map(),
   selection: new Set(),
   lastIndex: -1,
+  page: { index: 0, tokens: [undefined], nextToken: null, hasMore: false },
+  pageCache: new Map(), // 'dir\0search\0index' -> 页结果；只存最近 20 页
   loading: false,
   loadSeq: 0,
   panelCollapsed: true,
   tasks: new Map(),
 };
 
-/* ================= 目录加载与渲染 ================= */
+/* ================= 分页加载 ================= */
 
-async function loadDir(dir = state.currentDir, { silent = false } = {}) {
+const maskText = () => $('loadingMask').querySelector('.mask-text');
+
+function showMask(text) {
+  maskText().textContent = text;
+  $('loadingMask').classList.remove('hidden');
+}
+
+function hideMask() {
+  $('loadingMask').classList.add('hidden');
+}
+
+function resetPaging() {
+  state.page = { index: 0, tokens: [undefined], nextToken: null, hasMore: false, truncated: false };
+}
+
+function pageCacheKey(index) {
+  return `${state.currentDir}\u0000${state.search}\u0000${index}`;
+}
+
+/** 命中后重新插入，维持 LRU 顺序 */
+function cacheGet(key) {
+  const hit = state.pageCache.get(key);
+  if (!hit) return null;
+  state.pageCache.delete(key);
+  state.pageCache.set(key, hit);
+  return hit;
+}
+
+function cacheSet(key, value) {
+  state.pageCache.set(key, value);
+  while (state.pageCache.size > PAGE_CACHE_MAX) {
+    const oldest = state.pageCache.keys().next().value;
+    state.pageCache.delete(oldest);
+  }
+}
+
+/**
+ * 加载某一页。
+ * 第 0 页不带 token；后续页的 token 在上一页响应里已经存进 state.page.tokens。
+ */
+async function loadPage(index, { silent = false } = {}) {
   if (!state.configured) return;
+  if (index > 0 && !state.page.tokens[index]) return; // 没有游标说明已到末页
   const seq = ++state.loadSeq;
+
   if (!silent) {
     state.loading = true;
-    $('loadingMask').classList.remove('hidden');
+    showMask(index > 0 ? `正在加载第 ${index + 1} 页…` : '正在加载目录…');
   }
+
   try {
-    const res = await window.bridge.s3.list(dir);
-    if (seq !== state.loadSeq) return; // 已切换到其它目录，丢弃过期结果
-    state.currentDir = dir;
+    let res = cacheGet(pageCacheKey(index));
+    if (!res) {
+      res = await window.bridge.s3.list(state.currentDir, {
+        token: index === 0 ? undefined : state.page.tokens[index],
+        maxKeys: PAGE_SIZE,
+        search: state.search,
+      });
+      cacheSet(pageCacheKey(index), res);
+    }
+    if (seq !== state.loadSeq) return; // 已切到别的目录 / 搜索词，丢弃过期结果
+
+    state.page.index = index;
+    state.page.nextToken = res.nextToken || null;
+    // IsTruncated 但没有 token 属于服务端异常，别让「下一页」变成点了没反应的死按钮
+    state.page.hasMore = !!res.truncated && !!res.nextToken;
+    // 搜索模式不分页，但被截断时要说一声，否则用户以为只有这么多
+    state.page.truncated = !!res.truncated;
+    if (res.nextToken) state.page.tokens[index + 1] = res.nextToken;
+
     state.selection.clear();
     state.lastIndex = -1;
-    state.entries = [...res.dirs, ...res.files];
+    // dirs 里带的是 dir:true，统一成 isDir，后续渲染 / 进入目录只认一个字段
+    const dirs = (res.dirs || []).map((d) => ({ ...d, isDir: true }));
+    const files = (res.files || []).map((f) => ({ ...f, isDir: false }));
+    state.entries = [...dirs, ...files];
+    applySort();
+
     renderBreadcrumb();
     renderTable();
+    renderPager();
+    // 树只跟随高亮，不反向触发导航（避免 loadDir ⇄ 树选中 的循环）
+    if (tree) tree.setCurrent(state.currentDir);
   } catch (e) {
     if (seq === state.loadSeq) toast('加载目录失败：' + (e.message || e), 'err');
   } finally {
     if (seq === state.loadSeq) {
       state.loading = false;
-      $('loadingMask').classList.add('hidden');
+      hideMask();
+      setSearchBusy(false);
     }
   }
 }
+
+/** 换目录：搜索词跟着清掉（跨目录沿用搜索词只会让人困惑） */
+async function loadDir(dir = state.currentDir, { silent = false } = {}) {
+  if (!state.configured) return;
+  const next = String(dir || '');
+  const changed = next !== state.currentDir;
+  state.currentDir = next;
+  if (changed && state.search) {
+    state.search = '';
+    syncSearchInput();
+  }
+  await reloadCurrent({ silent });
+}
+
+/** 同一目录内重来（刷新 / 改搜索词 / 增删后）：清缓存并回到第 1 页 */
+async function reloadCurrent({ silent = false } = {}) {
+  state.pageCache.clear();
+  resetPaging();
+  await loadPage(0, { silent });
+}
+
+function goPrevPage() {
+  if (state.loading || state.page.index <= 0) return;
+  loadPage(state.page.index - 1);
+}
+
+function goNextPage() {
+  if (state.loading || !state.page.hasMore) return;
+  loadPage(state.page.index + 1);
+}
+
+/* ================= 排序（仅当前页） ================= */
+
+const SORTERS = {
+  name: (a, b) => a.name.localeCompare(b.name, 'zh-Hans-CN'),
+  size: (a, b) => (a.size || 0) - (b.size || 0),
+  time: (a, b) => String(a.mtime || '').localeCompare(String(b.mtime || '')),
+};
+
+/** 目录恒在前，文件按当前列排序；S3 没有全局排序，这里只作用于本页 */
+function applySort() {
+  const cmp = SORTERS[state.sort.by] || SORTERS.name;
+  const mul = state.sort.dir === 'desc' ? -1 : 1;
+  const dirs = state.entries.filter((e) => e.isDir).sort((a, b) => cmp(a, b) * mul);
+  const files = state.entries.filter((e) => !e.isDir).sort((a, b) => cmp(a, b) * mul);
+  state.entries = [...dirs, ...files];
+}
+
+function updateSortIndicators() {
+  document.querySelectorAll('.table-head .sortable').forEach((el) => {
+    const active = el.dataset.sort === state.sort.by;
+    el.classList.toggle('sorted', active);
+    const ind = el.querySelector('.sort-ind');
+    if (ind) ind.textContent = active ? (state.sort.dir === 'asc' ? '▲' : '▼') : '';
+  });
+}
+
+/* ================= 面包屑 ================= */
 
 function renderBreadcrumb() {
   const bc = $('breadcrumb');
@@ -73,71 +217,66 @@ function bucketLabel() {
   return window.__brand || '未连接';
 }
 
-function visibleRows() {
-  // Linux 风格：顶部固定 . 与 ..
-  const rows = [];
-  rows.push({ special: '.', name: '.', isDir: true });
-  rows.push({ special: '..', name: '..', isDir: true });
-  for (const e of state.entries) rows.push(e);
-  return rows;
+/* ================= 列表渲染 ================= */
+
+function rowHtml(r, idx) {
+  const selected = state.selection.has(r.key);
+  const cat = categoryOf(r.name, !!r.isDir);
+  const size = r.isDir ? '—' : fmtBytes(r.size);
+  const time = r.isDir ? '—' : fmtTime(r.mtime);
+  return `
+    <div class="row${selected ? ' selected' : ''}" data-idx="${idx}" data-key="${esc(r.key)}">
+      <label class="cell-check"><input type="checkbox"${selected ? ' checked' : ''} /></label>
+      <div class="cell-name">
+        <div class="file-ic ${cat}">${fileIconHtml(cat)}</div>
+        <span class="file-name" title="${esc(r.key)}">${esc(r.name)}</span>
+      </div>
+      <div class="cell-size">${size}</div>
+      <div class="cell-time">${time}</div>
+    </div>`;
 }
 
 function renderTable() {
   const body = $('tableBody');
-  const rows = visibleRows();
-  if (state.entries.length === 0) {
+  state.indexByKey = new Map();
+
+  if (!state.entries.length) {
+    const searching = !!state.search;
     body.innerHTML = `
       <div class="empty-state">
-        <div class="big">🗂</div>
-        <div>此目录为空</div>
-        <div style="font-size:11.5px">可拖拽文件/文件夹到此处上传，或使用上方按钮</div>
+        <div class="big">${fileIconHtml(searching ? 'other' : 'dir')}</div>
+        <div>${searching ? `没有以「${esc(state.search)}」开头的对象` : '此目录为空'}</div>
+        <div style="font-size:11.5px">${searching ? '区分大小写，只匹配名称开头（S3 前缀语义），换个开头的几个字试试' : '可拖拽文件/文件夹到此处上传，或使用上方按钮'}</div>
       </div>`;
   } else {
     let html = '';
-    rows.forEach((r, idx) => {
-      if (r.special) {
-        html += `
-          <div class="row special" data-idx="${idx}" data-special="${r.special}">
-            <label class="cell-check"></label>
-            <div class="cell-name">
-              <div class="file-ic dir">↩</div>
-              <span class="file-name" style="color:var(--dim)">${r.name}</span>
-            </div>
-            <div class="cell-size"></div>
-            <div class="cell-time"></div>
-          </div>`;
-        return;
-      }
-      const selected = state.selection.has(r.key);
-      const size = r.isDir ? '—' : fmtBytes(r.size);
-      const time = r.isDir ? '—' : fmtTime(r.mtime);
-      html += `
-        <div class="row ${selected ? 'selected' : ''}" data-idx="${idx}" data-key="${esc(r.key)}">
-          <label class="cell-check"><input type="checkbox" ${selected ? 'checked' : ''} /></label>
-          <div class="cell-name">
-            <div class="file-ic ${r.isDir ? 'dir' : 'file'}">${r.isDir ? '📁' : '📄'}</div>
-            <span class="file-name" title="${esc(r.name)}">${esc(r.name)}</span>
-          </div>
-          <div class="cell-size">${size}</div>
-          <div class="cell-time">${time}</div>
-        </div>`;
+    state.entries.forEach((r, idx) => {
+      state.indexByKey.set(r.key, idx);
+      html += rowHtml(r, idx);
     });
     body.innerHTML = html;
   }
+
+  updateSortIndicators();
   updateStatus();
   updateCheckAll();
 }
 
 function rowEntry(idx) {
-  const rows = visibleRows();
-  return rows[idx] || null;
+  return state.entries[idx] || null;
 }
 
 function updateStatus() {
   const total = state.entries.length;
   const sel = state.selection.size;
   const running = [...state.tasks.values()].filter((t) => t.status === 'running' || t.status === 'queued').length;
-  $('statLeft').textContent = `${total} 个项目${sel ? ` · 已选 ${sel} 项` : ''}${running ? ` · ${running} 个传输任务进行中` : ''}`;
+  const parts = [];
+  if (state.search) parts.push(`搜索「${state.search}」`);
+  parts.push(`第 ${state.page.index + 1} 页 · 本页 ${total} 项`);
+  if (state.page.hasMore) parts.push('还有更多');
+  if (sel) parts.push(`已选 ${sel} 项`);
+  if (running) parts.push(`${running} 个传输任务进行中`);
+  $('statLeft').textContent = parts.join(' · ');
 }
 
 function updateCheckAll() {
@@ -148,44 +287,89 @@ function updateCheckAll() {
   box.indeterminate = sel > 0 && sel < total;
 }
 
-/* ================= 选择与交互 ================= */
+function renderPager() {
+  const pager = $('pager');
+  if (state.search) {
+    // 搜索结果不分页：游标只能一路往后翻，而搜索该做的是加长前缀收窄范围
+    pager.classList.remove('hidden');
+    pager.classList.add('search-mode');
+    const n = state.entries.length;
+    $('pageLabel').textContent = n === 0
+      ? '无匹配'
+      : `匹配 ${n} 项${state.page.truncated ? '（已截断，加长前缀收窄）' : ''}`;
+    return;
+  }
+  pager.classList.remove('search-mode');
+  const show = state.page.index > 0 || state.page.hasMore;
+  pager.classList.toggle('hidden', !show);
+  $('pageLabel').textContent = `第 ${state.page.index + 1} 页`;
+  $('btnPrevPage').disabled = state.page.index <= 0;
+  $('btnNextPage').disabled = !state.page.hasMore;
+}
+
+/* ================= 选择（增量更新，不整表重绘） ================= */
+
+/** 只改目标行的 class 与勾选框：大目录下点一下就整表 innerHTML 会明显卡顿 */
+function repaintKeys(keys) {
+  const body = $('tableBody');
+  for (const key of keys) {
+    const idx = state.indexByKey.get(key);
+    if (idx === undefined) continue;
+    const row = body.querySelector(`.row[data-idx="${idx}"]`);
+    if (!row) continue;
+    const selected = state.selection.has(key);
+    row.classList.toggle('selected', selected);
+    const box = row.querySelector('input[type="checkbox"]');
+    if (box) box.checked = selected;
+  }
+  updateCheckAll();
+  updateStatus();
+}
 
 function selectOnly(idx) {
+  const prev = [...state.selection];
   state.selection.clear();
   const r = rowEntry(idx);
-  if (r && !r.special) state.selection.add(r.key);
+  if (r) state.selection.add(r.key);
   state.lastIndex = idx;
-  renderTable();
+  repaintKeys(prev.concat(r ? [r.key] : []));
 }
 
 function toggleSelect(idx) {
   const r = rowEntry(idx);
-  if (!r || r.special) return;
+  if (!r) return;
   if (state.selection.has(r.key)) state.selection.delete(r.key);
   else state.selection.add(r.key);
   state.lastIndex = idx;
-  renderTable();
+  repaintKeys([r.key]);
 }
 
 function rangeSelect(idx) {
   const from = Math.min(state.lastIndex < 0 ? idx : state.lastIndex, idx);
   const to = Math.max(state.lastIndex < 0 ? idx : state.lastIndex, idx);
+  const prev = [...state.selection];
   state.selection.clear();
+  const range = [];
   for (let i = from; i <= to; i++) {
     const r = rowEntry(i);
-    if (r && !r.special) state.selection.add(r.key);
+    if (r) { state.selection.add(r.key); range.push(r.key); }
   }
-  renderTable();
+  repaintKeys(prev.concat(range));
 }
 
 function selectedEntries() {
   return state.entries.filter((e) => state.selection.has(e.key));
 }
 
+function selectAll(checked) {
+  const prev = [...state.selection];
+  if (checked) state.selection = new Set(state.entries.map((e) => e.key));
+  else state.selection.clear();
+  repaintKeys(prev.concat(state.entries.map((e) => e.key)));
+}
+
 function enterDir(entry) {
-  if (entry.special === '.') return loadDir(state.currentDir);
-  if (entry.special === '..') return goUp();
-  if (!entry.isDir) return;
+  if (!entry || !entry.isDir) return;
   loadDir(entry.key);
 }
 
@@ -194,6 +378,64 @@ function goUp() {
   const parts = state.currentDir.split('/').filter(Boolean);
   parts.pop();
   loadDir(parts.join('/'));
+}
+
+/* ================= 搜索 ================= */
+
+/**
+ * 搜索框 → 服务端前缀查询，三条规矩：
+ * 1. **主动触发**：只有回车、点「搜索」按钮才发请求。输入过程中一个请求都不发，
+ *    边打边查等于每敲一个字打一次 S3，列表还会跟着不停重排。
+ * 2. 输入法组词期间不碰 value（否则候选状态被顶掉），上屏后再刷新按钮态。
+ * 3. 搜索期间的重新加载不盖遮罩（silent），只在搜索框上转个小圈。
+ * 清空搜索（✕ / Esc）回到当前目录的完整清单，这一步保持「点了就生效」。
+ */
+let composing = false;
+
+function setSearchBusy(busy) {
+  const box = $('searchInput').closest('.tb-search');
+  if (box) box.classList.toggle('searching', !!busy);
+}
+
+function syncSearchInput() {
+  const input = $('searchInput');
+  // 组词中回写 value 会把输入法的候选状态顶掉
+  if (!composing && input.value !== state.search) input.value = state.search;
+  refreshSearchControls();
+}
+
+/**
+ * 搜索控件态：清空按钮跟随输入框有无内容，搜索按钮在「输入框内容 ≠ 已生效关键词」时
+ * 高亮并可用 —— 也就是「有改动还没搜」。
+ */
+function refreshSearchControls() {
+  const input = $('searchInput');
+  const text = String(input.value || '');
+  const go = $('btnSearchGo');
+  $('btnSearchClear').classList.toggle('hidden', !text && !state.search);
+  go.disabled = !text.trim();
+  go.classList.toggle('dirty', text.trim() !== state.search);
+}
+
+function applySearch(value) {
+  const next = String(value || '').trim();
+  if (next === state.search) {
+    refreshSearchControls();
+    return;
+  }
+  state.search = next;
+  syncSearchInput();
+  if (!state.configured) return; // 还没连上，没有列表可搜
+  setSearchBusy(true);
+  reloadCurrent({ silent: true });
+}
+
+function clearSearch() {
+  const input = $('searchInput');
+  if (!state.search && !input.value) return;
+  input.value = '';
+  applySearch('');
+  syncSearchInput();
 }
 
 /* ================= 操作：上传/下载/删除/新建 ================= */
@@ -235,7 +477,8 @@ async function deleteSelection(entries) {
   try {
     const r = await window.bridge.s3.remove(entries.map((e) => ({ key: e.key, isDir: !!e.isDir })));
     toast(`已删除 ${r.count} 个对象`, 'ok');
-    loadDir(state.currentDir, { silent: true });
+    reloadCurrent({ silent: true });
+    if (tree) tree.refresh(state.currentDir);
   } catch (e) {
     toast('删除失败：' + (e.message || e), 'err');
   }
@@ -253,7 +496,8 @@ async function newFolder() {
     const key = state.currentDir ? state.currentDir + '/' + name : name;
     await window.bridge.s3.mkdir(key);
     toast('文件夹已创建', 'ok');
-    loadDir(state.currentDir, { silent: true });
+    reloadCurrent({ silent: true });
+    if (tree) tree.refresh(state.currentDir);
   } catch (e) {
     toast('创建失败：' + (e.message || e), 'err');
   }
@@ -365,28 +609,28 @@ function togglePanel(force) {
 /* ================= 右键菜单 ================= */
 
 function rowContextMenu(e, entry) {
-  const target = entry.special ? [] : [entry];
-  if (!entry.special && !state.selection.has(entry.key)) selectOnly(parseInt(e.target.closest('.row').dataset.idx, 10));
-  const sel = entry.special ? [] : selectedEntries();
-  const items = [];
-  if (sel.length) {
-    items.push({ label: '下载…', icon: '⤓', click: () => downloadSelection(sel) });
-    items.push({ label: '删除', icon: '✕', danger: true, click: () => deleteSelection(sel) });
+  if (!entry) return;
+  if (!state.selection.has(entry.key)) selectOnly(parseInt(e.target.closest('.row').dataset.idx, 10));
+  const sel = selectedEntries();
+  const items = [
+    { label: '下载…', icon: '⤓', click: () => downloadSelection(sel) },
+    { label: '删除', icon: '✕', danger: true, click: () => deleteSelection(sel) },
+  ];
+  if (!entry.isDir) {
     items.push('-');
-  }
-  if (entry.special === '..') items.push({ label: '返回上一级', icon: '↩', click: goUp });
-  if (entry.special === '.') items.push({ label: '刷新', icon: '↻', click: () => loadDir(state.currentDir) });
-  if (!entry.special && !entry.isDir) {
     items.push({ label: '复制名称', icon: '⧉', click: () => { navigator.clipboard.writeText(entry.name); toast('已复制名称', 'ok'); } });
+    items.push({ label: '复制完整路径', icon: '⌘', click: () => { navigator.clipboard.writeText(entry.key); toast('已复制路径', 'ok'); } });
   }
   items.push('-');
-  items.push({ label: '刷新', icon: '↻', click: () => loadDir(state.currentDir) });
+  items.push({ label: '刷新', icon: '↻', click: () => reloadCurrent() });
   showContextMenu(e.clientX, e.clientY, items);
 }
 
 function emptyContextMenu(e) {
   showContextMenu(e.clientX, e.clientY, [
-    { label: '刷新', icon: '↻', click: () => loadDir(state.currentDir) },
+    { label: '返回上一级', icon: '↩', disabled: !state.currentDir, click: goUp },
+    '-',
+    { label: '刷新', icon: '↻', click: () => reloadCurrent() },
     '-',
     { label: '上传文件…', icon: '⤒', click: uploadFiles },
     { label: '上传文件夹…', icon: '⇪', click: uploadFolder },
@@ -399,7 +643,7 @@ function emptyContextMenu(e) {
 function bindEvents() {
   // 工具栏
   $('btnUp').addEventListener('click', goUp);
-  $('btnRefresh').addEventListener('click', () => loadDir(state.currentDir));
+  $('btnRefresh').addEventListener('click', () => reloadCurrent());
   $('btnUploadFiles').addEventListener('click', uploadFiles);
   $('btnUploadFolder').addEventListener('click', uploadFolder);
   $('btnNewFolder').addEventListener('click', newFolder);
@@ -407,12 +651,47 @@ function bindEvents() {
   $('btnDelete').addEventListener('click', () => deleteSelection(selectedEntries()));
   $('btnSettings').addEventListener('click', openSettings);
 
-  // 全选
-  $('checkAll').addEventListener('change', () => {
-    if ($('checkAll').checked) state.selection = new Set(state.entries.map((e) => e.key));
-    else state.selection.clear();
-    renderTable();
+  // 分页
+  $('btnPrevPage').addEventListener('click', goPrevPage);
+  $('btnNextPage').addEventListener('click', goNextPage);
+
+  // 搜索：主动触发 —— 回车 / 点「搜索」按钮才查；Esc 清空回列表
+  const input = $('searchInput');
+  input.addEventListener('compositionstart', () => { composing = true; });
+  input.addEventListener('compositionend', () => {
+    composing = false;
+    refreshSearchControls();
   });
+  input.addEventListener('input', () => {
+    if (composing) return; // 拼音还没上屏，这时候的值是半成品
+    refreshSearchControls();
+  });
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      applySearch(input.value);
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      clearSearch();
+    }
+  });
+  $('btnSearchGo').addEventListener('click', () => applySearch(input.value));
+  $('btnSearchClear').addEventListener('click', () => { clearSearch(); input.focus(); });
+  refreshSearchControls();
+
+  // 列头排序（仅当前页）
+  document.querySelectorAll('.table-head .sortable').forEach((el) => {
+    el.addEventListener('click', () => {
+      const by = el.dataset.sort;
+      if (state.sort.by === by) state.sort.dir = state.sort.dir === 'asc' ? 'desc' : 'asc';
+      else { state.sort.by = by; state.sort.dir = 'asc'; }
+      applySort();
+      renderTable();
+    });
+  });
+
+  // 全选
+  $('checkAll').addEventListener('change', () => selectAll($('checkAll').checked));
 
   // 文件表
   const body = $('tableBody');
@@ -420,8 +699,7 @@ function bindEvents() {
     const row = e.target.closest('.row');
     if (!row) return;
     const idx = parseInt(row.dataset.idx, 10);
-    const entry = rowEntry(idx);
-    if (entry && entry.special) return;
+    if (!rowEntry(idx)) return;
     if (e.target.tagName === 'INPUT') {
       toggleSelect(idx);
       return;
@@ -445,10 +723,9 @@ function bindEvents() {
     if (e.key === 'Delete') deleteSelection(selectedEntries());
     else if (e.key === 'a' && (e.ctrlKey || e.metaKey)) {
       e.preventDefault();
-      state.selection = new Set(state.entries.map((x) => x.key));
-      renderTable();
+      selectAll(true);
     } else if (e.key === 'Backspace') goUp();
-    else if (e.key === 'F5') loadDir(state.currentDir);
+    else if (e.key === 'F5') reloadCurrent();
   });
 
   // 拖拽上传
@@ -480,20 +757,25 @@ function bindEvents() {
   });
   $('btnClearTransfers').addEventListener('click', async () => {
     await window.bridge.transfer.clear();
-    refreshTransfers();
+    // 主进程只清已结束的任务，本地映射同步剔除，否则列表会一直挂着旧条目
+    for (const [id, t] of [...state.tasks]) {
+      if (t.status === 'done' || t.status === 'error' || t.status === 'cancelled') state.tasks.delete(id);
+    }
+    renderTransfers();
   });
   window.bridge.transfer.onUpdate((task) => {
     state.tasks.set(task.id, task);
     renderTransfers();
     if (task.status === 'done' && task.type === 'upload') {
-      // 上传完成后刷新当前目录（轻量、静默）
-      loadDir(state.currentDir, { silent: true });
+      // 上传完成后刷新当前页（轻量、静默）
+      reloadCurrent({ silent: true });
+      if (tree) tree.refresh(state.currentDir);
     }
   });
 
   // 应用菜单
   window.bridge.onMenu(({ action }) => {
-    if (action === 'refresh') loadDir(state.currentDir);
+    if (action === 'refresh') reloadCurrent();
     else if (action === 'upload-files') uploadFiles();
     else if (action === 'upload-folder') uploadFolder();
     else if (action === 'new-folder') newFolder();
@@ -514,28 +796,16 @@ function bindEvents() {
     checkUpdates();
   });
 
-  // 下载进度（主进程节流推送）
-  window.bridge.update.onProgress((p) => {
-    if (progressDialog) progressDialog.setProgress(p);
-  });
-
-  // 启动后主进程静默探测到新版本：只留提示，不打断当前操作
-  window.bridge.update.onAvailable((r) => {
-    if (!r || !r.latest) return;
-    state.availableVersion = r.latest.version;
-    renderVersionLabel();
-    toast(`发现新版本 v${r.latest.version}，点击右下角版本号更新`, 'ok');
-  });
+  // 启动后主进程静默探测到新版本：弹窗提示（已请求静默的版本除外）
+  window.bridge.update.onAvailable((r) => { handleAvailableUpdate(r); });
 
   window.addEventListener('keydown', (e) => {
-    if (e.key === 'F5') { e.preventDefault(); loadDir(state.currentDir); }
+    if (e.key === 'F5') { e.preventDefault(); reloadCurrent(); }
     if (e.key === 'Escape') { document.getElementById('ctxRoot').innerHTML = ''; }
   });
 }
 
 /* ================= 版本更新 ================= */
-
-let progressDialog = null;
 
 function setVersionText(text) {
   $('statVersion').textContent = text;
@@ -592,7 +862,7 @@ function renderVersionLabel() {
   const el = $('statVersion');
   if (state.availableVersion) {
     el.textContent = `v${state.version} → v${state.availableVersion} 可更新`;
-    el.title = '点击下载更新';
+    el.title = '点击查看更新';
     el.classList.add('has-update');
   } else {
     el.textContent = `v${state.version}${state.electron ? ` · Electron ${state.electron}` : ''}`;
@@ -635,42 +905,73 @@ async function checkUpdates({ silent = false } = {}) {
   await promptUpdate(r.latest);
 }
 
-async function promptUpdate(latest) {
-  const choice = await updateAvailableDialog({ current: state.version, latest });
-  if (choice !== 'download') return;
+/**
+ * 启动探测命中新版本。
+ * 三种情况不弹：连接还没配好（否则和首次配置弹窗叠在一起）、用户勾过「不再提醒此版本」、
+ * 已经有弹窗在处理（避免慢网络下重复推两条事件弹两次）。
+ */
+async function handleAvailableUpdate(r) {
+  const latest = r && r.latest;
+  if (!latest || !latest.version) return;
 
-  progressDialog = updateProgressDialog({
-    version: latest.version,
-    onCancel: () => window.bridge.update.cancel(),
-  });
-
-  let res;
-  try {
-    res = await window.bridge.update.download(latest);
-  } catch (e) {
-    res = { ok: false, error: e.message || String(e) };
-  } finally {
-    if (progressDialog) { progressDialog.close(); progressDialog = null; }
-  }
-
-  if (!res || !res.ok) {
-    toast('下载更新失败：' + ((res && res.error) || '未知错误'), 'err');
-    return;
-  }
-  state.availableVersion = '';
+  state.availableVersion = latest.version;
   renderVersionLabel();
 
-  const install = await confirmDialog({
-    title: '下载完成',
-    text: `v${esc(latest.version)} 安装包已下载到：<br/><code style="font-size:11.5px">${esc(res.filePath)}</code><br/><br/>现在运行安装程序吗？（安装前建议先退出本程序）`,
-    okText: '立即安装',
-  });
-  if (!install) {
-    toast('已保存安装包，可稍后手动运行', '');
+  if (!state.configured) {
+    state.pendingUpdate = latest;
     return;
   }
-  const r = await window.bridge.update.install(res.filePath);
-  if (!r || !r.ok) toast('启动安装程序失败：' + ((r && r.error) || '未知错误'), 'err');
+  if (state.mutedVersion && state.mutedVersion === latest.version) {
+    toast(`发现新版本 v${latest.version}（本版本已忽略提醒，点右下角版本号可查看）`, '');
+    return;
+  }
+  await promptUpdate(latest);
+}
+
+/**
+ * 发现新版本 → 交给弹窗走完「下载 → 唤起安装器」。
+ * 无论是否忽略过，手动点版本号走这里都会弹（忽略只作用于启动自动提醒）。
+ */
+async function promptUpdate(latest) {
+  if (!latest || !latest.version || state.promptingUpdate) return;
+  state.promptingUpdate = true;
+
+  let downloaded = null;
+  let result;
+  try {
+    result = await updateAvailableDialog({
+      current: state.version,
+      latest,
+      actions: {
+        download: async () => {
+          const res = await window.bridge.update.download(latest);
+          if (res && res.ok) downloaded = res;
+          return res;
+        },
+        install: async () => {
+          if (!downloaded) return { ok: false, error: '还没有下载好的安装包' };
+          return window.bridge.update.install(downloaded.filePath);
+        },
+        reveal: () => window.bridge.update.reveal(downloaded && downloaded.filePath),
+        cancel: () => window.bridge.update.cancel(),
+        skip: async () => {
+          try {
+            state.mutedVersion = await window.bridge.update.muteVersion(latest.version);
+            toast(`已跳过 v${latest.version}，出现更新的版本时还会提示`, '');
+          } catch { /* 落盘失败只影响下次是否再弹 */ }
+        },
+      },
+    });
+  } finally {
+    state.promptingUpdate = false;
+  }
+
+  // 安装包已经落到本地，状态栏不必再挂着「可更新」
+  if (downloaded) {
+    state.availableVersion = '';
+    renderVersionLabel();
+  }
+  return result;
 }
 
 /* ================= 设置与启动 ================= */
@@ -681,14 +982,40 @@ async function openSettings() {
   if (result && result.saved) {
     applyConfig(result.config);
     toast('配置已保存', 'ok');
-    loadDir('');
+    // bucket / prefix 可能变了，树的缓存整体作废
+    if (tree) tree.refresh('');
+    await loadDir('');
+    await flushPendingUpdate();
   }
+}
+
+/** 连接配置完成后，补弹启动时因未配置而压住的新版本提示 */
+async function flushPendingUpdate() {
+  if (!state.pendingUpdate) return;
+  const latest = state.pendingUpdate;
+  state.pendingUpdate = null;
+  if (state.mutedVersion === latest.version) return;
+  await promptUpdate(latest);
 }
 
 function applyConfig(cfg) {
   state.configured = !!cfg;
   window.__brand = cfg ? `${cfg.bucket}${cfg.prefix ? ' / ' + cfg.prefix : ''}` : '未连接';
   $('brandBucket').textContent = window.__brand;
+}
+
+async function initTree() {
+  if (tree) return;
+  tree = createTree({
+    panel: $('treePanel'),
+    body: $('treeBody'),
+    splitter: $('treeSplitter'),
+    expandBtn: $('btnTreeExpand'),
+    collapseBtn: $('btnTreeCollapse'),
+    refreshBtn: $('btnTreeRefresh'),
+    onOpen: (key) => loadDir(key),
+  });
+  await tree.init();
 }
 
 async function boot() {
@@ -699,6 +1026,11 @@ async function boot() {
   state.channel = info.updateChannel || 'stable';
   renderChannelBadge();
   renderVersionLabel();
+  renderPager();
+  try {
+    state.mutedVersion = (await window.bridge.update.mutedVersion()) || '';
+  } catch { /* 读不到就按未忽略处理 */ }
+
   const cfg = await window.bridge.config.get();
   applyConfig(cfg);
   bindEvents();
@@ -710,12 +1042,69 @@ async function boot() {
     const r = await configDialog(null, { canCancel: false });
     if (r && r.saved) {
       applyConfig(r.config);
-      loadDir('');
+      state.configured = true;
+      await initTree();
+      await loadDir('');
+      await flushPendingUpdate();
     }
   } else {
     state.configured = true;
-    loadDir('');
+    await initTree();
+    await loadDir('');
   }
+}
+
+/**
+ * 冒烟测试钩子：仅 QINGSTOR_SMOKE=1 时存在。
+ * 让主进程能在没有 bucket 的情况下注入假目录，验证图标、选择态、分页条等渲染逻辑。
+ */
+if (window.bridge.env && window.bridge.env.smoke) {
+  window.__smoke = {
+    state,
+    inject(entries) {
+      state.configured = true;
+      state.currentDir = '';
+      state.search = '';
+      resetPaging();
+      state.selection.clear();
+      state.lastIndex = -1;
+      state.entries = entries || [];
+      state.pageCache.clear();
+      renderBreadcrumb();
+      renderTable();
+      renderPager();
+    },
+    selectOnly,
+    setPage(index, hasMore) {
+      state.page.index = index;
+      state.page.hasMore = !!hasMore;
+      renderPager();
+    },
+    setSearch(v) {
+      state.search = String(v || '');
+      syncSearchInput();
+      renderPager();
+    },
+    /**
+     * 冒烟用：把「发现新版本」弹窗按真实参数打开，用来核对文案与按钮流转。
+     * 不传真实 actions —— 冒烟只验界面，不真的下载。
+     */
+    openUpdateMock() {
+      updateAvailableDialog({
+        current: '0.0.1-dev.1',
+        latest: {
+          version: '1.0.0-dev',
+          channel: 'dev',
+          platform: 'win',
+          arch: 'x64',
+          size: 87765432,
+          publishedAt: new Date('2026-10-28T09:26:00Z').toISOString(),
+          notes: '新增左侧目录树、文件类型图标、大目录分页与前缀搜索。',
+        },
+        actions: { download: () => ({ ok: false, error: 'smoke' }) },
+      });
+    },
+  };
 }
 
 boot();

@@ -236,9 +236,13 @@ export function showContextMenu(x, y, items) {
       menu.appendChild(sep);
     } else {
       const el = document.createElement('div');
-      el.className = 'ctx-item' + (it.danger ? ' danger' : '');
+      el.className = 'ctx-item' + (it.danger ? ' danger' : '') + (it.disabled ? ' disabled' : '');
       el.textContent = (it.icon ? it.icon + '  ' : '') + it.label;
-      el.addEventListener('click', () => { closeContextMenu(); it.click(); });
+      el.addEventListener('click', () => {
+        if (it.disabled) return;
+        closeContextMenu();
+        it.click();
+      });
       menu.appendChild(el);
     }
   }
@@ -268,14 +272,37 @@ export function closeContextMenu() {
 
 /* ---------------- 更新相关弹窗 ---------------- */
 
-/** 发现新版本，resolve('download' | 'later') */
-export function updateAvailableDialog({ current, latest }) {
+/**
+ * 发现新版本弹窗：下载与安装都在这一处走完。
+ *
+ * 形态对齐参考项目 myApiTools——单弹窗内嵌进度条，下载完成直接唤起系统安装器，
+ * 不再单独开一个「下载更新」窗口、也不再追问一次「现在安装吗」。
+ *
+ * 文案刻意不提「系统会弹安全提示」：安装包是本程序自己写到磁盘上的，不经过浏览器，
+ * 不会被 macOS 打上 com.apple.quarantine 隔离标记；唤起安装器覆盖安装同一路径不会
+ * 新增隔离标记，所以不会因为「来自身份不明的开发者」在每次更新时被反复拦一次。
+ * 唯一可能出现的是一次性的 SmartScreen 提示，跟这段文案有没有写没关系。
+ *
+ * actions: { download(), install(), reveal(), cancel(), skip() }
+ * resolve({ action: 'later' | 'skip' | 'installed', downloaded: boolean })
+ */
+export function updateAvailableDialog({ current, latest, actions }) {
+  let downloaded = null;
+  let busy = false;
+  let outcome = 'later';
+  let unsubscribe = null;
+
   return new Promise((resolve) => {
     const notes = latest.notes
       ? `<div class="upd-notes">${esc(latest.notes).replace(/\n/g, '<br/>')}</div>`
       : '';
+    const meta = [
+      esc(latest.channel), esc(latest.platform), esc(latest.arch), esc(fmtBytes(latest.size)),
+      latest.publishedAt ? esc(fmtTime(new Date(latest.publishedAt).toISOString())) : '',
+    ].filter(Boolean).join(' · ');
+
     const { mask, close } = openModal(`
-      <div class="modal" style="width:440px">
+      <div class="modal" style="width:460px">
         <div class="modal-head">
           <div class="modal-title">发现新版本</div>
           <button class="modal-close" data-close>✕</button>
@@ -285,49 +312,126 @@ export function updateAvailableDialog({ current, latest }) {
             <span class="upd-ver">v${esc(latest.version)}</span>
             <span class="upd-from">当前 v${esc(current)}</span>
           </div>
-          <div class="upd-meta">${esc(latest.channel)} 渠道 · ${esc(latest.platform)} · ${esc(latest.arch)} · ${esc(fmtBytes(latest.size))}${latest.publishedAt ? ' · ' + esc(fmtTime(new Date(latest.publishedAt).toISOString())) : ''}</div>
+          <div class="upd-meta">${meta}</div>
           ${notes}
-          <div class="hint" style="margin-top:12px">下载完成后需手动运行安装包完成升级（程序未做代码签名，系统会弹一次安全提示）。</div>
+          <div class="upd-progress" id="updProgress" hidden>
+            <div class="pbar"><div class="pbar-fill" id="updBar"></div></div>
+            <div class="upd-progress-line"><span id="updDetail">准备中…</span><span id="updPct">0%</span></div>
+          </div>
+          <div class="upd-result" id="updResult" hidden></div>
+          <div class="hint">下载完成后会直接唤起安装程序。安装过程会关闭本应用，请先把正在编辑的内容存好；连接配置、渠道与界面状态都不会被清除。</div>
         </div>
         <div class="modal-foot">
-          <button class="btn" data-close>以后再说</button>
-          <button class="btn primary" id="updGo">下载更新</button>
+          <button class="btn" id="updReveal" hidden>打开所在文件夹</button>
+          <button class="btn" id="updLater">稍后</button>
+          <button class="btn" id="updSkip">跳过此版本</button>
+          <button class="btn primary" id="updGo">下载并安装</button>
         </div>
-      </div>`);
-    let done = false;
-    mask.querySelector('#updGo').addEventListener('click', () => { done = true; resolve('download'); close(); });
-    mask.addEventListener('mousedown', (e) => { if (e.target === mask && !done) resolve('later'); });
-    mask.querySelectorAll('[data-close]').forEach((b) => b.addEventListener('click', () => { if (!done) resolve('later'); }));
-  });
-}
+      </div>`, {
+      onClose: () => {
+        if (unsubscribe) { unsubscribe(); unsubscribe = null; }
+        if (busy) actions.cancel && actions.cancel();
+        resolve({ action: outcome, downloaded: !!downloaded });
+      },
+    });
 
-/** 下载进度弹窗，返回 { setProgress, setDetail, close } */
-export function updateProgressDialog({ version, onCancel }) {
-  const { mask, close } = openModal(`
-    <div class="modal" style="width:420px">
-      <div class="modal-head"><div class="modal-title">下载更新 v${esc(version)}</div></div>
-      <div class="modal-body">
-        <div class="pbar" style="height:8px"><div class="pbar-fill" id="updBar"></div></div>
-        <div class="upd-progress-line"><span id="updDetail">准备中…</span><span id="updPct">0%</span></div>
-      </div>
-      <div class="modal-foot"><button class="btn" id="updCancel">取消</button></div>
-    </div>`);
-  mask.querySelector('#updCancel').addEventListener('click', () => {
-    mask.querySelector('#updDetail').textContent = '正在取消…';
-    mask.querySelector('#updCancel').disabled = true;
-    onCancel && onCancel();
-  });
-  return {
-    setProgress(p) {
+    const q = (sel) => mask.querySelector(sel);
+    const bar = q('#updBar');
+    const pctEl = q('#updPct');
+    const detail = q('#updDetail');
+    const progressWrap = q('#updProgress');
+    const resultEl = q('#updResult');
+    const btnGo = q('#updGo');
+    const btnSkip = q('#updSkip');
+    const btnReveal = q('#updReveal');
+    const btnLater = q('#updLater');
+
+    const setBar = (pct, cls) => {
+      bar.style.width = pct + '%';
+      bar.className = 'pbar-fill' + (cls ? ' ' + cls : '');
+    };
+    const setResult = (msg, tone) => {
+      resultEl.hidden = !msg;
+      resultEl.className = 'upd-result' + (tone ? ' ' + tone : '');
+      resultEl.textContent = msg || '';
+    };
+
+    // 主进程按 ~200ms 节流推送 {received,total,pct}
+    unsubscribe = window.bridge.update.onProgress((p) => {
+      if (!busy) return;
       const pct = Math.max(0, Math.min(100, Math.round(Number(p && p.pct) || 0)));
-      mask.querySelector('#updBar').style.width = pct + '%';
-      mask.querySelector('#updPct').textContent = pct + '%';
-      mask.querySelector('#updDetail').textContent =
-        `${fmtBytes(p.received)}${p.total ? ' / ' + fmtBytes(p.total) : ''}`;
-    },
-    setDetail(text) { mask.querySelector('#updDetail').textContent = text; },
-    close,
-  };
+      setBar(pct);
+      pctEl.textContent = pct + '%';
+      detail.textContent = '下载中 ' + fmtBytes(p.received) + (p.total ? ' / ' + fmtBytes(p.total) : '');
+    });
+
+    btnLater.addEventListener('click', close);
+    btnReveal.addEventListener('click', () => { if (actions.reveal) actions.reveal(); });
+    btnSkip.addEventListener('click', async () => {
+      outcome = 'skip';
+      btnSkip.disabled = true;
+      if (actions.skip) await actions.skip();
+      close();
+    });
+
+    const runInstall = async () => {
+      detail.textContent = `已下载 ${fmtBytes((downloaded && downloaded.size) || latest.size)}，正在唤起安装程序…`;
+      const opened = await actions.install();
+      if (opened && opened.ok) {
+        outcome = 'installed';
+        setResult('安装程序已打开，请按提示完成安装。安装完成后重新启动本程序即可。', 'ok');
+        btnGo.disabled = false;
+        btnGo.textContent = '再次打开安装程序';
+        btnSkip.hidden = true;
+        btnReveal.hidden = false;
+      } else {
+        setBar(100, 'fail');
+        setResult(((opened && opened.error) || '无法打开安装程序') + ' 可点「打开所在文件夹」手动运行。', 'err');
+        btnGo.disabled = false;
+        btnGo.textContent = '重试打开';
+        btnReveal.hidden = false;
+      }
+    };
+
+    btnGo.addEventListener('click', async () => {
+      if (downloaded) return runInstall();
+
+      busy = true;
+      btnGo.disabled = true;
+      btnSkip.disabled = true;
+      btnLater.disabled = true;
+      btnGo.textContent = '下载中…';
+      progressWrap.hidden = false;
+      setBar(0);
+      pctEl.textContent = '0%';
+      detail.textContent = '开始下载…';
+      setResult('');
+
+      let res;
+      try {
+        res = await actions.download();
+      } catch (e) {
+        res = { ok: false, error: (e && e.message) || String(e) };
+      }
+      busy = false;
+      btnSkip.disabled = false;
+      btnLater.disabled = false;
+
+      if (!res || !res.ok) {
+        btnGo.disabled = false;
+        btnGo.textContent = '重试下载';
+        setBar(0, 'fail');
+        detail.textContent = '下载失败';
+        setResult((res && res.error) || '下载失败', 'err');
+        return;
+      }
+
+      downloaded = res;
+      setBar(100, 'done');
+      pctEl.textContent = '100%';
+      await runInstall();
+    });
+  });
 }
 
 /* ---------------- SVG/字符图标 ---------------- */

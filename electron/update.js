@@ -75,6 +75,50 @@ class ChannelStore {
   }
 }
 
+/**
+ * 「不再提醒此版本」记录：userData/update-muted.json
+ *
+ * 只记一个版本号：同一个版本被勾过忽略就不再自动弹窗，换新版本号会重新开始提醒。
+ * 与 update-channel.json 分开，切换渠道不该顺带清掉用户的忽略选择。
+ */
+class MuteStore {
+  constructor(userDataDir) {
+    this.file = path.join(userDataDir, 'update-muted.json');
+    this.version = '';
+  }
+
+  load() {
+    try {
+      const raw = JSON.parse(fs.readFileSync(this.file, 'utf8'));
+      this.version = String(raw.version || '').trim();
+    } catch { /* 没有文件或内容坏了，视为未忽略任何版本 */ }
+    return this.version;
+  }
+
+  get() {
+    return this.version;
+  }
+
+  set(version) {
+    this.version = String(version || '').trim();
+    this.persist();
+    return this.version;
+  }
+
+  clear() {
+    this.version = '';
+    this.persist();
+    return this.version;
+  }
+
+  persist() {
+    try {
+      fs.mkdirSync(path.dirname(this.file), { recursive: true });
+      fs.writeFileSync(this.file, JSON.stringify({ version: this.version }, null, 2), 'utf8');
+    } catch { /* 落盘失败只影响下次启动是否再弹，不该阻断当前流程 */ }
+  }
+}
+
 /** process.platform → 服务端认的 win / mac / linux */
 function platformTag(p = process.platform) {
   if (p === 'win32') return 'win';
@@ -191,7 +235,7 @@ function absoluteUrl(base, u) {
 /* ---------------- 检查更新 ---------------- */
 
 /**
- * GET /api/releases/latest?platform=win&arch=x64&channel=dev&current=0.0.1-dev
+ * GET /api/releases/latest?platform=win&arch=x64&channel=dev&current=1.0.0-dev
  *
  * 永远不抛异常：失败也返回 { ok:false, error }，调用方只管看 ok。
  * 服务端「该渠道没发过包」返回 latest:null / updateAvailable:false，这里照旧透出，
@@ -392,6 +436,7 @@ module.exports = {
   CHANNELS,
   CHANNEL_LABELS,
   ChannelStore,
+  MuteStore,
   resolveBase,
   resolveChannel,
   platformTag,

@@ -4,6 +4,7 @@ const crypto = require('node:crypto');
 const fs = require('node:fs');
 const http = require('node:http');
 const https = require('node:https');
+const { Transform } = require('node:stream');
 const { normalizeKey, normalizePrefix } = require('./index');
 
 /**
@@ -221,8 +222,13 @@ module.exports = function createS3(cfg) {
     return `HTTP ${res.status}${peek ? ' · ' + peek : ''}`;
   }
 
-  /* ---- 预签名 GET ---- */
-  function signedUrl(relKey, opts) {
+  /* ---- 预签名（GET 下载 / PUT 直传共用一套算法） ---- */
+  /**
+   * 浏览器直传必须走 publicEndpoint：签名里的 Host 参与计算，而调 put() 时用的
+   * endpoint 可能是内网地址（ECS 与 OBS 同区域走内网省钱）。浏览器在公网上，
+   * 只认公网域名 —— 签内网地址的 URL 给它，DNS 都解析不了。
+   */
+  function presign(method, relKey, opts) {
     const key = fullKey(relKey);
     const encodedPath = objectPath(key);
     const expires = Math.min(
@@ -247,12 +253,12 @@ module.exports = function createS3(cfg) {
     // 关键：这里用的 Host 必须是**客户端实际访问**的那个（publicEndpoint）
     const canonicalHeaders = `host:${requestHost(publicEndpoint)}\n`;
     const canonicalRequest = [
-      'GET',
+      method,
       encodedPath,
       canonicalQuery,
       canonicalHeaders,
       'host',
-      'UNSIGNED-PAYLOAD', // 预签名不允许对 body 做哈希（客户端不会再发一次）
+      'UNSIGNED-PAYLOAD', // 预签名不知道 body 内容，客户端也不会再发一次
     ].join('\n');
 
     const stringToSign = [
@@ -268,6 +274,20 @@ module.exports = function createS3(cfg) {
     ).toString('hex');
 
     return `${originOf(publicEndpoint)}${encodedPath}?${canonicalQuery}&X-Amz-Signature=${signature}`;
+  }
+
+  function signedUrl(relKey, opts) {
+    return presign('GET', relKey, opts);
+  }
+
+  /**
+   * 浏览器直传用的预签名 PUT 地址。
+   * 用 UNSIGNED-PAYLOAD：文件在浏览器里，签名时不可能先算出整包哈希。
+   * 因此这里不做任何内容校验 —— 完整性靠 complete 阶段的 HEAD 尺寸核对，
+   * 以及随后 sha256Of() 的回读校验兜底。
+   */
+  function signedPutUrl(relKey, opts) {
+    return presign('PUT', relKey, Object.assign({ expires: 1800 }, opts || {}));
   }
 
   /* ---- PUT 的签名头（流式与 Buffer 共用） ---- */
@@ -383,6 +403,7 @@ module.exports = function createS3(cfg) {
     /**
      * 上传临时文件。流式发送，不进内存 —— 300MB 的包不能整块读。
      * 调用方负责保证 meta.sha256 与文件内容一致：它既是校验值也是签名值。
+     * meta.onProgress(sent, total) 可选，用于把转存进度透出到管理端。
      */
     async put(relKey, tmpFile, meta) {
       const m = meta || {};
@@ -395,12 +416,40 @@ module.exports = function createS3(cfg) {
       const contentType = m.contentType || 'application/octet-stream';
 
       const { encodedPath, headers } = putHeaders(relKey, size, payloadHash, contentType);
+
+      /**
+       * 进度统计走一层 Transform，而不是给源流挂 'data' 监听。
+       * 源流一旦有 'data' 监听就进入 flowing 模式 —— 在 pipe 之前挂上去会直接丢数据。
+       * Transform 串在 readStream 与 req 之间，背压链完整：req 慢 → meter 缓冲 → 源流暂停。
+       */
+      let sent = 0;
+      let lastReportAt = 0;
+      const onProgress = typeof m.onProgress === 'function' ? m.onProgress : null;
+
+      const src = fs.createReadStream(tmpFile);
+      const meter = new Transform({
+        transform(chunk, _enc, cb) {
+          sent += chunk.length;
+          const now = Date.now();
+          // 80MB 按 64KB 分片是一千多次回调，全抛给上层没有意义，节流到 200ms
+          if (onProgress && (now - lastReportAt >= 200 || sent >= size)) {
+            lastReportAt = now;
+            try { onProgress(sent, size); } catch { /* 进度回调不该影响上传本身 */ }
+          }
+          cb(null, chunk);
+        },
+      });
+      // pipe 不会把错误反向传回源流，句柄会一直开着，所以两头都挂上
+      src.on('error', (e) => meter.destroy(e));
+      meter.on('error', () => src.destroy());
+      src.pipe(meter);
+
       const res = await send({
         method: 'PUT',
         ep: endpoint,
         encodedPath,
         headers,
-        bodyStream: fs.createReadStream(tmpFile),
+        bodyStream: meter,
       });
 
       if (res.status < 200 || res.status >= 300) {
@@ -410,6 +459,57 @@ module.exports = function createS3(cfg) {
     },
 
     signedUrl,
+
+    signedPutUrl,
+
+    /**
+     * 探一个字节，拿「对象在不在 + 总长度」。
+     * 不用真正的 HEAD：该存储对 HEAD 一律 403，而预签名只签 GET，
+     * GET 的签名不能改 method 复用。改用预签名 GET + Range 只取首字节，
+     * 语义一样但不会把整个对象拖下来。
+     */
+    async stat(relKey) {
+      const url = signedUrl(relKey, { expires: 120 });
+      const resp = await fetch(url, { headers: { Range: 'bytes=0-0' } });
+      if (resp.status === 404) return null;
+      if (!resp.ok && resp.status !== 206) {
+        throw new Error(`探测对象失败：HTTP ${resp.status}`);
+      }
+      const cr = resp.headers.get('content-range') || '';
+      const total = Number(cr.split('/')[1]);
+      const size = Number.isFinite(total) && total > 0
+        ? total
+        : Number(resp.headers.get('content-length') || 0);
+      try { await resp.arrayBuffer(); } catch { /* 只为释放连接 */ }
+      return { size };
+    },
+
+    /**
+     * 回读对象、流式计算 sha256。
+     * 浏览器直传时服务端从没碰过文件内容，只能把字节从存储侧拉回来算一遍。
+     * 走预签名 GET，和公开下载是同一条路径，因此只需要 GetObject 权限。
+     * 注意：这是**下行**流量，不要在上传的关键路径上同步等它。
+     */
+    async sha256Of(relKey, onProgress) {
+      const url = signedUrl(relKey, { expires: 600 });
+      const resp = await fetch(url, { signal: AbortSignal.timeout(30 * 60 * 1000) });
+      if (!resp.ok || !resp.body) {
+        throw new Error(`回读对象失败：HTTP ${resp.status}`);
+      }
+      const hash = crypto.createHash('sha256');
+      let size = 0;
+      let lastAt = 0;
+      for await (const chunk of resp.body) {
+        size += chunk.length;
+        hash.update(chunk);
+        const now = Date.now();
+        if (typeof onProgress === 'function' && now - lastAt >= 200) {
+          lastAt = now;
+          try { onProgress(size); } catch { /* 进度回调不影响校验 */ }
+        }
+      }
+      return { sha256: hash.digest('hex'), size };
+    },
 
     async remove(relKey) {
       const { encodedPath, headers } = deleteHeaders(relKey);

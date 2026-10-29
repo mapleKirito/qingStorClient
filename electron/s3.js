@@ -63,14 +63,127 @@ async function testConnection(cfg) {
 }
 
 /**
- * 列举一个「目录」。
- * 返回 { dirs: [{name, key}], files: [{name, key, size, mtime}] }，均为相对 basePrefix 的路径。
+ * 列举一个「目录」的**一页**（游标分页）。
+ *
+ * 返回 { dirs: [{name, key, dir}], files: [{name, key, size, mtime}], truncated, nextToken }
+ *
+ * 为什么必须分页：ListObjectsV2 一次最多 1000 条，旧实现 do...while 一路翻到底，
+ * 10 万对象的目录要发上百次请求；现在只发一次，翻页由调用方带着 nextToken 继续。
+ * S3 没有偏移量，只能「下一页」，后退靠调用方缓存已取到的页。
+ *
+ * search 走服务端 Prefix（等价 LIKE '关键词%'）：能命中尚未加载的页，零内存成本，
+ * 但**搜不到名字中间包含关键词的对象** —— S3 协议本身不提供该能力。
  */
-async function listDir(client, cfg, dir) {
+async function listDir(client, cfg, dir, { token, maxKeys = 200, search = '' } = {}) {
   const base = names.dirKey(cfg.prefix);
-  const prefix = base + names.dirKey(dir); // dir 为相对路径（'' 表示根）
-  const dirs = new Map();
+  const dirPrefix = base + names.dirKey(dir); // dir 为相对路径（'' 表示根）
+  const keyword = String(search || '').trim();
+  const prefix = keyword ? dirPrefix + keyword : dirPrefix;
+  const limit = Math.min(1000, Math.max(1, Math.round(Number(maxKeys) || 200)));
+
+  const res = await client.send(new ListObjectsV2Command({
+    Bucket: cfg.bucket,
+    Prefix: prefix,
+    Delimiter: '/',
+    MaxKeys: limit,
+    ContinuationToken: token || undefined,
+  }));
+
+  const dirs = [];
+  for (const cp of res.CommonPrefixes || []) {
+    const rel = names.stripPrefix(cp.Prefix, cfg.prefix).replace(/\/+$/, '');
+    const name = names.basename(rel);
+    if (name) dirs.push({ name, key: rel, dir: true });
+  }
+
   const files = [];
+  for (const obj of res.Contents || []) {
+    if (obj.Key === prefix) continue; // 目录占位对象自身
+    const rel = names.stripPrefix(obj.Key, cfg.prefix);
+    if (rel === '' || rel.endsWith('/')) continue;
+    const name = names.basename(rel);
+    if (!name) continue;
+    files.push({
+      name,
+      key: rel,
+      size: obj.Size || 0,
+      mtime: obj.LastModified ? obj.LastModified.toISOString() : '',
+    });
+  }
+
+  const sortName = (a, b) => a.name.localeCompare(b.name, 'zh-Hans-CN');
+  return {
+    dirs: dirs.sort(sortName),
+    files: files.sort(sortName),
+    truncated: !!res.IsTruncated,
+    nextToken: res.IsTruncated ? (res.NextContinuationToken || '') : '',
+  };
+}
+
+/**
+ * 前缀搜索（严格遵循 S3 的 Prefix 语义）。
+ *
+ * S3 的 Prefix 是**字节精确**匹配，接口没有 case-insensitive 开关。曾经用「原样/全小写/
+ * 全大写/首字母大写」四个变体并发绕过，但只要服务的实际行为与假设有偏差，就会出现
+ * 「看起来能搜到一半、另一半搜不到」这种更难解释的结果，而且请求量翻倍。既然接口本身
+ * 不支持，就不在客户端造兼容：`zj` 只匹配 `zj`，不匹配 `ZJ` / `Zj`。
+ *
+ * 与 listDir 的区别：
+ * - 不分页。一次最多取 maxKeys 条，搜索本来就该靠加长前缀收窄，而不是翻页；
+ *   返回的 nextToken 恒为空，由渲染层把分页条收起来。
+ * - 命中范围就是「当前目录下以关键词开头的项」，不做二次过滤（Prefix 已经把范围收窄，
+ *   再按 name 复核只会把关键词含 / 的跨层查询误杀）。
+ */
+async function searchDir(client, cfg, dir, keyword, { maxKeys = 200 } = {}) {
+  const base = names.dirKey(cfg.prefix);
+  const dirPrefix = base + names.dirKey(dir);
+  const kw = String(keyword || '').trim();
+  const limit = Math.min(1000, Math.max(1, Math.round(Number(maxKeys) || 200)));
+
+  const res = await client.send(new ListObjectsV2Command({
+    Bucket: cfg.bucket,
+    Prefix: dirPrefix + kw,
+    Delimiter: '/',
+    MaxKeys: limit,
+  }));
+
+  const dirs = [];
+  const files = [];
+  for (const cp of res.CommonPrefixes || []) {
+    const rel = names.stripPrefix(cp.Prefix, cfg.prefix).replace(/\/+$/, '');
+    const name = names.basename(rel);
+    if (name) dirs.push({ name, key: rel, dir: true });
+  }
+  for (const obj of res.Contents || []) {
+    const rel = names.stripPrefix(obj.Key, cfg.prefix);
+    if (rel === '' || rel.endsWith('/')) continue;
+    const name = names.basename(rel);
+    if (!name) continue;
+    files.push({
+      name,
+      key: rel,
+      size: obj.Size || 0,
+      mtime: obj.LastModified ? obj.LastModified.toISOString() : '',
+    });
+  }
+
+  const sortName = (a, b) => a.name.localeCompare(b.name, 'zh-Hans-CN');
+  return {
+    dirs: dirs.sort(sortName),
+    files: files.sort(sortName),
+    truncated: !!res.IsTruncated,
+    nextToken: '',
+  };
+}
+
+/**
+ * 只列举子目录（供左侧目录树使用）。
+ * 不返回文件 —— 树只需要一层目录名，把文件也拉回来在万级目录下是纯浪费。
+ * 单层目录超过 maxKeys 时置 truncated，由调用方决定怎么提示。
+ */
+async function listDirs(client, cfg, dir, { maxKeys = 500 } = {}) {
+  const prefix = names.dirKey(cfg.prefix) + names.dirKey(dir);
+  const dirs = [];
   let token;
   do {
     const res = await client.send(new ListObjectsV2Command({
@@ -78,31 +191,18 @@ async function listDir(client, cfg, dir) {
       Prefix: prefix,
       Delimiter: '/',
       ContinuationToken: token,
-      MaxKeys: 1000,
+      MaxKeys: maxKeys,
     }));
     for (const cp of res.CommonPrefixes || []) {
       const rel = names.stripPrefix(cp.Prefix, cfg.prefix).replace(/\/+$/, '');
       const name = names.basename(rel);
-      if (name) dirs.set(rel, { name, key: rel, dir: true });
-    }
-    for (const obj of res.Contents || []) {
-      if (obj.Key === prefix) continue; // 目录占位对象自身
-      const rel = names.stripPrefix(obj.Key, cfg.prefix);
-      if (rel === '' || rel.endsWith('/')) continue;
-      const name = names.basename(rel);
-      if (!name) continue;
-      files.push({
-        name,
-        key: rel,
-        size: obj.Size || 0,
-        mtime: obj.LastModified ? obj.LastModified.toISOString() : '',
-      });
+      if (name) dirs.push({ name, key: rel });
     }
     token = res.IsTruncated ? res.NextContinuationToken : undefined;
-  } while (token);
+  } while (token && dirs.length < maxKeys);
 
   const sortName = (a, b) => a.name.localeCompare(b.name, 'zh-Hans-CN');
-  return { dirs: [...dirs.values()].sort(sortName), files: files.sort(sortName) };
+  return { dirs: dirs.sort(sortName), truncated: !!token || dirs.length > maxKeys };
 }
 
 /** 递归列举前缀下所有对象 key（相对 basePrefix），用于文件夹删除/统计。 */
@@ -206,6 +306,8 @@ module.exports = {
   createClient,
   testConnection,
   listDir,
+  searchDir,
+  listDirs,
   listAll,
   deleteKeys,
   deleteDir,

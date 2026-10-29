@@ -7,6 +7,9 @@ const { contextBridge, ipcRenderer, webUtils } = require('electron');
 contextBridge.exposeInMainWorld('bridge', {
   info: () => ipcRenderer.invoke('app:info'),
 
+  /** 运行环境标记（冒烟测试用，正常启动为 false） */
+  env: { smoke: process.env.QINGSTOR_SMOKE === '1' },
+
   /** 拖拽上传时把 File 对象转换为本地绝对路径 */
   pathForFile: (file) => {
     try { return webUtils.getPathForFile(file); } catch { return ''; }
@@ -20,9 +23,15 @@ contextBridge.exposeInMainWorld('bridge', {
 
   s3: {
     test: (cfg) => ipcRenderer.invoke('s3:test', cfg),
-    list: (dir) => ipcRenderer.invoke('s3:list', dir),
+    list: (dir, opts) => ipcRenderer.invoke('s3:list', dir, opts),
+    listDirs: (dir) => ipcRenderer.invoke('s3:listDirs', dir),
     mkdir: (dir) => ipcRenderer.invoke('s3:mkdir', dir),
     remove: (entries) => ipcRenderer.invoke('s3:delete', entries),
+  },
+
+  uiState: {
+    get: () => ipcRenderer.invoke('uiState:get'),
+    save: (partial) => ipcRenderer.invoke('uiState:save', partial),
   },
 
   dialog: {
@@ -52,6 +61,9 @@ contextBridge.exposeInMainWorld('bridge', {
     check: () => ipcRenderer.invoke('update:check'),
     channel: () => ipcRenderer.invoke('update:channel'),
     setChannel: (channel) => ipcRenderer.invoke('update:setChannel', channel),
+    mutedVersion: () => ipcRenderer.invoke('update:muted'),
+    muteVersion: (version) => ipcRenderer.invoke('update:mute', version),
+    unmute: () => ipcRenderer.invoke('update:unmute'),
     download: (latest) => ipcRenderer.invoke('update:download', latest),
     cancel: () => ipcRenderer.invoke('update:cancel'),
     install: (filePath) => ipcRenderer.invoke('update:install', filePath),

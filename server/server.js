@@ -289,6 +289,19 @@ if (!releaseColumns.some((c) => c.name === 'storage')) {
 }
 
 /**
+ * 校验值状态。浏览器直传时服务端没接触文件内容，sha256 只能事后回读算出，
+ * 于是「已发布」和「校验值已就绪」变成两件事，必须能分别表示：
+ *   verified = 校验值可信（中转上传当场算出，或回读已完成，或 1.3.0 之前的存量）
+ *   pending  = 已发布但校验值还在后台算
+ *   failed   = 回读失败，需要重试
+ * 存量记录默认 verified —— 它们的 sha256 是当年边收边算的，本来就是对的。
+ */
+if (!releaseColumns.some((c) => c.name === 'checksum_status')) {
+  db.exec("ALTER TABLE releases ADD COLUMN checksum_status TEXT NOT NULL DEFAULT 'verified'");
+  console.log('[migrate] releases 新增 checksum_status 列，存量记录标记为 verified');
+}
+
+/**
  * 历史脏数据修复：1.2.0 及更早版本用 path.join(channel, version) 生成 file_path，
  * 在 Windows 上会写成 `stable\2.0.1\xxx.exe`。反斜杠一旦进库，拿到 Linux 容器里
  * 就永远找不到文件（且 s3 的对象 key 会变成一个带反斜杠的怪名字）。
@@ -307,13 +320,15 @@ try {
 
 const stmt = {
   insertRelease: db.prepare(`
-    INSERT INTO releases (channel, version, platform, arch, file_name, file_path, size, sha256, notes, downloads, published_at, published_ip, storage)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
+    INSERT INTO releases (channel, version, platform, arch, file_name, file_path, size, sha256, notes, downloads, published_at, published_ip, storage, checksum_status)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
   `),
   overwriteRelease: db.prepare(`
-    UPDATE releases SET file_name = ?, file_path = ?, size = ?, sha256 = ?, notes = ?, published_at = ?, published_ip = ?, storage = ?
+    UPDATE releases SET file_name = ?, file_path = ?, size = ?, sha256 = ?, notes = ?, published_at = ?, published_ip = ?, storage = ?, checksum_status = ?
     WHERE id = ?
   `),
+  setChecksum: db.prepare('UPDATE releases SET sha256 = ?, checksum_status = ? WHERE id = ?'),
+  listPendingChecksum: db.prepare("SELECT * FROM releases WHERE checksum_status = 'pending'"),
   findReleaseById: db.prepare('SELECT * FROM releases WHERE id = ?'),
   findReleaseByKey: db.prepare(
     'SELECT * FROM releases WHERE channel = ? AND version = ? AND platform = ? AND arch = ?'
@@ -600,6 +615,9 @@ function releaseRowToJson(row) {
     fileName: row.file_name,
     size: row.size,
     sha256: row.sha256,
+    // verified / pending / failed。客户端不认这个字段也没关系 ——
+    // pending 时 sha256 为空，客户端本来就会跳过哈希校验（只比长度）。
+    checksumStatus: row.checksum_status || 'verified',
     notes: row.notes || '',
     downloads: row.downloads,
     publishedAt: row.published_at,
@@ -899,9 +917,22 @@ function serveAdminPage(res) {
     'referrer-policy': 'no-referrer',
     'content-security-policy':
       "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; " +
-      "img-src 'self' data:; connect-src 'self'",
+      "img-src 'self' data:; connect-src 'self'" + storageConnectOrigin(),
   });
   res.end(body);
+}
+
+/**
+ * 浏览器直传要连对象存储的公网端点，CSP 的 connect-src 必须放行它 ——
+ * 否则请求在发出之前就被页面策略拦掉，控制台只留一句 CSP 违规，
+ * 看起来像是「点了没反应」。driver 不是 s3 时返回空串，行为与之前一致。
+ */
+function storageConnectOrigin() {
+  try {
+    const d = STORAGE.describe();
+    if (d && d.publicEndpoint) return ' ' + new URL(d.publicEndpoint).origin;
+  } catch { /* 描述信息异常不该让管理页打不开 */ }
+  return '';
 }
 
 /**
@@ -928,6 +959,220 @@ function adminTokenMatches(req) {
   const given = String(req.headers['x-admin-token'] || '').trim();
   if (!given || !adminToken) return false;
   return safeEqual(given, adminToken);
+}
+
+/* ------------------------------------------------------------------ *
+ * 上传进度
+ *
+ * 一个 80MB 的包有两个阶段，进度来源完全不同：
+ *   1. 浏览器 → 服务器：XHR 的 upload.onprogress 就能覆盖；
+ *   2. 服务器 → 对象存储：这一段客户端完全看不见（数据早就发完了），
+ *      以前只能靠 docker stats 猜，看起来就像卡死在 100%。
+ *
+ * 所以把第 2 段的状态放在服务端内存里，客户端用 job id 轮询。
+ * 只存内存、不落库：进程重启后进度没有意义，前端自己会超时退出。
+ * ------------------------------------------------------------------ */
+const UPLOAD_JOBS = new Map();
+const UPLOAD_JOB_TTL = 120_000; // 完成/失败后留 2 分钟，够前端取到最后一次状态
+const UPLOAD_JOB_MAX = 200;
+
+function pruneUploadJobs(now) {
+  const t = now || Date.now();
+  for (const [id, job] of UPLOAD_JOBS) {
+    if (t - job.updatedAt > UPLOAD_JOB_TTL) UPLOAD_JOBS.delete(id);
+  }
+  if (UPLOAD_JOBS.size > UPLOAD_JOB_MAX) {
+    const oldest = [...UPLOAD_JOBS.entries()].sort((a, b) => a[1].updatedAt - b[1].updatedAt);
+    for (let i = 0; i < oldest.length - UPLOAD_JOB_MAX; i++) UPLOAD_JOBS.delete(oldest[i][0]);
+  }
+}
+
+/** job id 由客户端生成并随上传请求带来，格式收紧一点，别让任意串进内存表 */
+function isValidJobId(id) {
+  return /^[A-Za-z0-9_-]{6,64}$/.test(String(id || ''));
+}
+
+function uploadJobStart(id, total) {
+  pruneUploadJobs();
+  const now = Date.now();
+  const job = {
+    phase: 'receiving',
+    total: Number(total) || 0,
+    received: 0,
+    transferred: 0,
+    size: 0,
+    speed: 0,
+    message: '',
+    startedAt: now,
+    updatedAt: now,
+    lastBytes: 0,
+    lastAt: now,
+  };
+  UPLOAD_JOBS.set(id, job);
+  return job;
+}
+
+/**
+ * 更新字节数与瞬时速率。
+ * 速率先算差分再和上一次做 EMA（0.6/0.4）：TCP 上行本来就一顿一顿的，
+ * 直接把相邻两次之差显示出来会跳成 0 或者几十 MB/s。
+ */
+function uploadJobBytes(job, bytes) {
+  if (!job) return;
+  const now = Date.now();
+  const dt = (now - job.lastAt) / 1000;
+  if (dt >= 0.2) {
+    const inst = Math.max(0, bytes - job.lastBytes) / dt;
+    job.speed = job.speed ? job.speed * 0.6 + inst * 0.4 : inst;
+    job.lastBytes = bytes;
+    job.lastAt = now;
+  }
+  job.updatedAt = now;
+}
+
+function uploadJobFinish(job, phase, message) {
+  if (!job) return;
+  job.phase = phase;
+  job.message = message || '';
+  job.updatedAt = Date.now();
+}
+
+function uploadJobJson(job) {
+  return {
+    ok: true,
+    phase: job.phase,
+    total: job.total,
+    received: job.received,
+    transferred: job.transferred,
+    size: job.size,
+    speed: Math.round(job.speed || 0),
+    elapsed: Math.round((Date.now() - job.startedAt) / 1000),
+    message: job.message,
+  };
+}
+
+/**
+ * 管理端新增接口用 JSON body，量都很小（几百字节），64KB 足够。
+ * 老的发布接口是原始字节流，不走这里 —— 两者不能混，否则会把安装包读进内存。
+ */
+function readJsonBody(req, limit) {
+  const max = limit || 64 * 1024;
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let n = 0;
+    let done = false;
+    req.on('data', (c) => {
+      if (done) return;
+      n += c.length;
+      if (n > max) {
+        done = true;
+        reject(Object.assign(new Error(`请求体超过 ${max} 字节`), { status: 413 }));
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on('end', () => {
+      if (done) return;
+      const text = Buffer.concat(chunks).toString('utf8').trim();
+      if (!text) return resolve({});
+      try {
+        const obj = JSON.parse(text);
+        if (!obj || typeof obj !== 'object' || Array.isArray(obj)) {
+          return reject(Object.assign(new Error('请求体必须是 JSON 对象'), { status: 400 }));
+        }
+        resolve(obj);
+      } catch {
+        reject(Object.assign(new Error('请求体不是合法 JSON'), { status: 400 }));
+      }
+    });
+    req.on('error', reject);
+  });
+}
+
+/**
+ * 发布元信息校验。中转上传和直传的 prepare 阶段共用同一套规则，
+ * 抽出来免得两边各写一份、以后改了这边忘了那边。
+ */
+function normalizeReleaseMeta(src) {
+  const get = (k) => String((src && src[k]) || '').trim();
+  const version = get('version');
+  const channel = get('channel') || DEFAULT_CHANNEL;
+  const platform = normalizePlatform(get('platform'));
+  const arch = normalizeArch(get('arch'));
+
+  const bad = (msg, code) => Object.assign(new Error(msg), { status: 400, code });
+  if (!parseVersion(version)) {
+    throw bad('版本号必须形如 1.2.3（可带 -beta.1 之类的预发布后缀）', 'BAD_VERSION');
+  }
+  if (!/^[a-z0-9][a-z0-9._-]{0,31}$/.test(channel)) {
+    throw bad('渠道名只能是小写字母、数字和 . _ -', 'BAD_CHANNEL');
+  }
+  if (!PLATFORMS.has(platform)) throw bad('平台必须是 win / mac / linux 之一', 'BAD_PLATFORM');
+  if (!ARCHES.has(arch)) throw bad('架构必须是 x64 / arm64 / ia32 / armv7l 之一', 'BAD_ARCH');
+
+  const safeName = sanitizeFileName(get('fileName')) || defaultFileName(version, platform, arch);
+  return { version, channel, platform, arch, safeName, relPath: [channel, version, safeName].join('/') };
+}
+
+/* ------------------------------------------------------------------ *
+ * 校验值回读
+ *
+ * 浏览器直传时服务端没经手文件内容，sha256 只能把对象从存储里拉回来算一遍。
+ * 这是下行流量、要几十秒到几分钟，所以放在后台串行队列里：
+ *   - 串行而不是并发：几条回读同时抢同一条下行带宽只会互相拖慢；
+ *   - 落库状态而不是只留内存：进程重启后还能从 checksum_status='pending' 捡回来。
+ * ------------------------------------------------------------------ */
+const CHECKSUM_QUEUE = [];
+const CHECKSUM_MAX_ATTEMPTS = 3;
+let checksumRunning = false;
+
+function enqueueChecksum(id) {
+  if (!CHECKSUM_QUEUE.includes(id)) CHECKSUM_QUEUE.push(id);
+  runChecksumWorker();
+}
+
+async function checksumOnce(id) {
+  const row = stmt.findReleaseById.get(id);
+  if (!row) return 'gone';
+  if (row.checksum_status !== 'pending') return 'skip';
+  const target = storageFor(row.storage || 'local');
+  if (!target || typeof target.sha256Of !== 'function') {
+    throw new Error(`当前未配置 ${row.storage} 驱动，无法回读校验值`);
+  }
+  const { sha256, size } = await target.sha256Of(row.file_path);
+  if (size !== row.size) {
+    throw new Error(`回读大小与记录不一致（库里 ${row.size}，实际 ${size}）`);
+  }
+  stmt.setChecksum.run(sha256, 'verified', id);
+  console.log(`[checksum] #${id} 校验完成：${sha256.slice(0, 12)}…（${size} 字节）`);
+  return 'ok';
+}
+
+async function runChecksumWorker() {
+  if (checksumRunning) return;
+  checksumRunning = true;
+  try {
+    while (CHECKSUM_QUEUE.length) {
+      const id = CHECKSUM_QUEUE.shift();
+      let settled = false;
+      for (let attempt = 1; attempt <= CHECKSUM_MAX_ATTEMPTS && !settled; attempt++) {
+        try {
+          await checksumOnce(id);
+          settled = true; // ok / skip / gone 都不需要再试
+        } catch (e) {
+          console.error(`[checksum] #${id} 第 ${attempt}/${CHECKSUM_MAX_ATTEMPTS} 次回读失败：${e.message}`);
+          if (attempt === CHECKSUM_MAX_ATTEMPTS) {
+            stmt.setChecksum.run('', 'failed', id);
+            settled = true;
+          } else {
+            await new Promise((r) => setTimeout(r, attempt * 3000));
+          }
+        }
+      }
+    }
+  } finally {
+    checksumRunning = false;
+  }
 }
 
 /**
@@ -975,6 +1220,10 @@ async function adminUploadRelease(req, res, url) {
     return fail(res, 413, `安装包超过上限 ${RELEASE_MAX_MB} MB`, 'TOO_LARGE');
   }
 
+  // 校验都没过才建任务：被 400/413 拒掉的请求不该在内存表里留垃圾
+  const jobParam = String(q.get('job') || '').trim();
+  const job = isValidJobId(jobParam) ? uploadJobStart(jobParam, declaredLen) : null;
+
   fs.mkdirSync(TMP_DIR, { recursive: true });
 
   /**
@@ -1004,6 +1253,11 @@ async function adminUploadRelease(req, res, url) {
           return;
         }
         hash.update(chunk);
+        // 每 1MB 或 300ms 上报一次：80MB 有一千多个分片，全报没意义
+        if (job && (size - job.received >= 1 << 20 || Date.now() - job.updatedAt >= 300)) {
+          job.received = size;
+          uploadJobBytes(job, size);
+        }
         // 磁盘慢时暂停请求流，避免整包堆在内存里
         if (!ws.write(chunk)) {
           req.pause();
@@ -1034,15 +1288,30 @@ async function adminUploadRelease(req, res, url) {
 
   if (failure) {
     discardPartial();
+    uploadJobFinish(job, 'failed', '接收数据失败：' + failure.message);
     return fail(res, failure.status || 500, '上传失败：' + failure.message, 'UPLOAD_FAILED');
   }
   if (tooBig) {
     discardPartial();
+    uploadJobFinish(job, 'failed', `超过上限 ${RELEASE_MAX_MB} MB`);
     return fail(res, 413, `安装包超过上限 ${RELEASE_MAX_MB} MB`, 'TOO_LARGE');
   }
   if (!size) {
     discardPartial();
+    uploadJobFinish(job, 'failed', '上传内容为空');
     return fail(res, 400, '上传内容为空', 'EMPTY_BODY');
+  }
+
+  // 收包到此结束，接下来是服务器 → 对象存储的转存阶段
+  if (job) {
+    job.phase = 'transferring';
+    job.received = size;
+    job.size = size;
+    job.transferred = 0;
+    job.speed = 0;
+    job.lastBytes = 0;
+    job.lastAt = Date.now();
+    job.updatedAt = Date.now();
   }
 
   const sha256 = hash.digest('hex');
@@ -1056,9 +1325,24 @@ async function adminUploadRelease(req, res, url) {
    * 而且从管理端看不出问题。失败就宁可不写库，让这次发布整体失败。
    */
   try {
-    await STORAGE.put(relPath, tmpFile, { size, sha256, contentType: 'application/octet-stream' });
+    await STORAGE.put(relPath, tmpFile, {
+      size,
+      sha256,
+      contentType: 'application/octet-stream',
+      // local 驱动会忽略这个回调（rename 是瞬时的），s3 驱动边发边报
+      onProgress: job
+        ? (sent) => {
+            job.transferred = sent;
+            uploadJobBytes(job, sent);
+            // 数据发完但对象存储还没回响应，单独标一个阶段：
+            // 前端能区分「还在传」和「都发完了在等对方确认」，不会误判成卡死
+            if (sent >= size && job.phase === 'transferring') job.phase = 'waiting';
+          }
+        : null,
+    });
   } catch (e) {
     discardPartial();
+    uploadJobFinish(job, 'failed', '写入对象存储失败：' + e.message);
     console.error('[upload] 写入存储失败：', e.message);
     return fail(res, 502, '写入存储失败：' + e.message, 'STORAGE_WRITE_FAILED');
   }
@@ -1092,12 +1376,15 @@ async function adminUploadRelease(req, res, url) {
   let id;
   if (existing) {
     stmt.overwriteRelease.run(
-      safeName, relPath, size, sha256, notes || existing.notes, now, ip, STORAGE.name, existing.id
+      safeName, relPath, size, sha256, notes || existing.notes, now, ip, STORAGE.name,
+      'verified', // 中转上传是边收边算的，校验值当场就准
+      existing.id
     );
     id = existing.id;
   } else {
     const r = stmt.insertRelease.run(
-      channel, version, platform, arch, safeName, relPath, size, sha256, notes || null, now, ip, STORAGE.name
+      channel, version, platform, arch, safeName, relPath, size, sha256, notes || null,
+      now, ip, STORAGE.name, 'verified'
     );
     id = Number(r.lastInsertRowid);
   }
@@ -1105,9 +1392,163 @@ async function adminUploadRelease(req, res, url) {
   audit(req, existing ? 'release.overwrite' : 'release.publish',
     `${channel}/${version} ${platform}-${arch} ${safeName} (${size} 字节)`);
 
+  // 对象和库都落定了才算 done，前端轮询到的最后一次状态就是它
+  uploadJobFinish(job, 'done', `${channel}/${version} ${platform}-${arch}`);
+
   return send(res, existing ? 200 : 201, {
     ok: true,
     replaced: !!existing,
+    release: releaseRowToJson(stmt.findReleaseById.get(id)),
+  });
+}
+
+/**
+ * POST /api/admin/uploads/prepare
+ * 浏览器直传的第一步：校验元信息、占一个上传任务、签发 PUT 地址。
+ * 真正的大文件字节不经过这里，所以这个请求只有几百字节。
+ */
+async function adminPrepareUpload(req, res) {
+  if (STORAGE.name !== 's3') {
+    return fail(
+      res, 409,
+      '当前存储驱动不支持浏览器直传，请走 PUT /api/admin/releases',
+      'DIRECT_UPLOAD_UNSUPPORTED'
+    );
+  }
+
+  let body;
+  try { body = await readJsonBody(req); }
+  catch (e) { return fail(res, e.status || 400, e.message, 'BAD_BODY'); }
+
+  let meta;
+  try { meta = normalizeReleaseMeta(body); }
+  catch (e) { return fail(res, e.status || 400, e.message, e.code || 'BAD_META'); }
+
+  const size = Number(body.size);
+  if (!Number.isFinite(size) || size <= 0) {
+    return fail(res, 400, '缺少文件大小（size）', 'BAD_SIZE');
+  }
+  if (size > RELEASE_MAX_BYTES) {
+    return fail(res, 413, `安装包超过上限 ${RELEASE_MAX_MB} MB`, 'TOO_LARGE');
+  }
+
+  const jobId = crypto.randomBytes(9).toString('base64url');
+  const job = uploadJobStart(jobId, size);
+  // 直传没有「服务端接收」这个阶段，进度由浏览器的 upload.onprogress 自己算；
+  // task 在这里的作用是把元信息带到 complete 阶段
+  job.phase = 'uploading';
+  job.size = size;
+  job.meta = meta;
+
+  const putUrl = STORAGE.signedPutUrl(meta.relPath, { expires: 1800 });
+  console.log(
+    `[upload] 直传准备：${meta.channel}/${meta.version} ${meta.platform}-${meta.arch} ` +
+    `${meta.safeName}（${size} 字节）`
+  );
+
+  return send(res, 200, {
+    ok: true,
+    jobId,
+    relPath: meta.relPath,
+    putUrl,
+    expiresIn: 1800,
+    overwrite: !!stmt.findReleaseByKey.get(meta.channel, meta.version, meta.platform, meta.arch),
+  });
+}
+
+/**
+ * POST /api/admin/uploads/complete
+ * 浏览器直传完成后登记：核对对象确实存在、大小对得上，写库，再排队回读算 sha256。
+ * 校验值是异步补的，所以这条记录会先以 checksum_status='pending' 出现在列表里。
+ */
+async function adminCompleteUpload(req, res) {
+  if (STORAGE.name !== 's3') {
+    return fail(res, 409, '当前存储驱动不支持浏览器直传', 'DIRECT_UPLOAD_UNSUPPORTED');
+  }
+
+  let body;
+  try { body = await readJsonBody(req); }
+  catch (e) { return fail(res, e.status || 400, e.message, 'BAD_BODY'); }
+
+  const jobId = String(body.jobId || '').trim();
+  const job = isValidJobId(jobId) ? UPLOAD_JOBS.get(jobId) : null;
+  if (!job || !job.meta) {
+    return fail(res, 404, '上传任务不存在或已过期，请重新开始上传', 'JOB_NOT_FOUND');
+  }
+
+  const meta = job.meta;
+  const size = job.size;
+  const notes = String(body.notes || '').slice(0, 20000);
+
+  // 浏览器说「传完了」不算数：回存储侧确认对象真的在、长度也对
+  let stat = null;
+  try {
+    stat = await STORAGE.stat(meta.relPath);
+  } catch (e) {
+    return fail(res, 502, '无法确认对象是否写入：' + e.message, 'STORAGE_STAT_FAILED');
+  }
+  if (!stat) {
+    return fail(res, 400, '对象存储里找不到这个文件，上传可能没真正完成', 'OBJECT_MISSING');
+  }
+  if (stat.size !== size) {
+    return fail(
+      res, 400,
+      `对象大小与声明不一致（声明 ${size}，存储里 ${stat.size}）`,
+      'SIZE_MISMATCH'
+    );
+  }
+
+  const now = Date.now();
+  const ip = clientIp(req);
+  const existing = stmt.findReleaseByKey.get(meta.channel, meta.version, meta.platform, meta.arch);
+
+  // 覆盖发布：新对象已经落在目标 key 上，旧对象若在别处要清掉
+  if (existing) {
+    const oldStorage = existing.storage || 'local';
+    const oldPath = String(existing.file_path || '').replace(/\\/g, '/');
+    const sameTarget = oldStorage === STORAGE.name && oldPath === meta.relPath;
+    if (!sameTarget) {
+      const oldStore = storageFor(oldStorage);
+      if (oldStore) {
+        try { await oldStore.remove(oldPath); }
+        catch (e) { console.error('[upload] 清理旧对象失败（不影响本次发布）：', e.message); }
+      } else {
+        console.warn(
+          `[upload] 旧记录存放在 ${oldStorage}，当前未配置该驱动，旧对象未清理：${oldPath}`
+        );
+      }
+    }
+  }
+
+  let id;
+  if (existing) {
+    stmt.overwriteRelease.run(
+      meta.safeName, meta.relPath, size, '', notes || existing.notes, now, ip, STORAGE.name,
+      'pending',
+      existing.id
+    );
+    id = existing.id;
+  } else {
+    const r = stmt.insertRelease.run(
+      meta.channel, meta.version, meta.platform, meta.arch, meta.safeName, meta.relPath, size, '',
+      notes || null, now, ip, STORAGE.name, 'pending'
+    );
+    id = Number(r.lastInsertRowid);
+  }
+
+  audit(
+    req, existing ? 'release.overwrite' : 'release.publish',
+    `${meta.channel}/${meta.version} ${meta.platform}-${meta.arch} ${meta.safeName} ` +
+    `(${size} 字节，浏览器直传，校验值待算)`
+  );
+
+  uploadJobFinish(job, 'done', `${meta.channel}/${meta.version} ${meta.platform}-${meta.arch}`);
+  enqueueChecksum(id);
+
+  return send(res, existing ? 200 : 201, {
+    ok: true,
+    replaced: !!existing,
+    checksum: 'pending',
     release: releaseRowToJson(stmt.findReleaseById.get(id)),
   });
 }
@@ -1159,6 +1600,20 @@ async function adminDeleteRelease(req, res, id) {
 
   audit(req, 'release.delete', `${row.channel}/${row.version} ${row.platform}-${row.arch} ${row.file_name}`);
   send(res, 200, { ok: true, deleted: releaseRowToJson(row) });
+}
+
+/** 校验值回读失败（或想强制重算）时的入口：置回 pending 再排一次队 */
+function adminRecheckChecksum(req, res, id) {
+  const row = stmt.findReleaseById.get(id);
+  if (!row) return fail(res, 404, '发布记录不存在', 'NOT_FOUND');
+  if (row.checksum_status === 'pending') {
+    return send(res, 200, { ok: true, checksum: 'pending', message: '已经在排队计算' });
+  }
+  // 保留旧的 sha256：重算期间客户端还能按老值校验，算完再覆盖
+  stmt.setChecksum.run(row.sha256 || '', 'pending', id);
+  enqueueChecksum(id);
+  audit(req, 'release.recheck', `#${id} 重新计算校验值`);
+  return send(res, 200, { ok: true, checksum: 'pending' });
 }
 
 function adminListAudit(req, res, query) {
@@ -1251,7 +1706,8 @@ function handleAdminSide(req, res) {
   }
 
   const ip = socketIp(req);
-  if (tooManyRequests(`admin:${ip}`, 120, 60_000)) {
+  // 进度轮询是 1 秒一次的内存查询，算进 120/分钟会把一次正常发布自己限流掉
+  if (p !== '/api/admin/upload-progress' && tooManyRequests(`admin:${ip}`, 120, 60_000)) {
     return fail(res, 429, '管理端请求过于频繁', 'RATE_LIMITED');
   }
 
@@ -1277,6 +1733,21 @@ function handleAdminSide(req, res) {
     });
   }
 
+  if (p === '/api/admin/upload-progress' && (req.method === 'GET' || req.method === 'HEAD')) {
+    pruneUploadJobs();
+    const id = String(url.searchParams.get('job') || '');
+    const state = isValidJobId(id) ? UPLOAD_JOBS.get(id) : null;
+    // 找不到不算错误：进程重启、任务过期、id 拼错都落到这里，前端据此停掉轮询
+    return send(res, 200, state ? uploadJobJson(state) : { ok: true, phase: 'unknown' });
+  }
+
+  if (p === '/api/admin/uploads/prepare' && req.method === 'POST') {
+    return guardAsync(res, adminPrepareUpload(req, res));
+  }
+  if (p === '/api/admin/uploads/complete' && req.method === 'POST') {
+    return guardAsync(res, adminCompleteUpload(req, res));
+  }
+
   if (p === '/api/admin/releases') {
     if (req.method === 'GET' || req.method === 'HEAD') return adminListReleases(req, res, url.searchParams);
     // PUT 是语义正确的写法；同时接受 POST，因为不少工具（Postman、各种 HTTP 库）
@@ -1290,6 +1761,12 @@ function handleAdminSide(req, res) {
   const m = /^\/api\/admin\/releases\/(\d+)$/.exec(p);
   if (m && req.method === 'DELETE') {
     return guardAsync(res, adminDeleteRelease(req, res, Number(m[1])));
+  }
+
+  // 校验值回读失败时的手动重试入口
+  const recheck = /^\/api\/admin\/releases\/(\d+)\/recheck$/.exec(p);
+  if (recheck && req.method === 'POST') {
+    return adminRecheckChecksum(req, res, Number(recheck[1]));
   }
 
   if (p === '/api/admin/audit' && req.method === 'GET') {
@@ -1397,6 +1874,23 @@ async function runStorageSelfCheck() {
     console.error(
       '[storage] 自检失败（服务继续运行，但上传/下载可能不可用）：' + storageStatus.detail
     );
+  }
+  resumePendingChecksums();
+}
+
+/**
+ * 进程重启后把没算完的校验值捡回来。
+ * 队列只在内存里，靠库里的 pending 状态保证最终一致 —— 否则一次重启
+ * 就会留下一条永远没有 sha256、客户端永远跳过校验的记录。
+ */
+function resumePendingChecksums() {
+  try {
+    const rows = stmt.listPendingChecksum.all();
+    if (!rows.length) return;
+    console.log(`[checksum] 有 ${rows.length} 条记录的校验值待补，重新排队`);
+    for (const r of rows) enqueueChecksum(r.id);
+  } catch (e) {
+    console.error('[checksum] 恢复待校验记录失败：', e.message);
   }
 }
 
